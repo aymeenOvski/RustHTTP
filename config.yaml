@@ -1,0 +1,14 @@
+# Placeholder — Person B decides the final format and writes the parser.
+servers:
+  - host: 127.0.0.1
+    ports: [8080]
+    default: true
+    client_max_body_size: 1000000
+    error_pages:
+      404: ./error_pages/404.html
+    routes:
+      - path: /
+        root: ./www
+        methods: [GET, POST, DELETE]
+        index: index.html
+        autoindex: false
