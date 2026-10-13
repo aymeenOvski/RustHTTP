@@ -1,6 +1,6 @@
 //! Owner: Person A — mio event loop, listeners, timeouts.
 use std::collections::HashMap;
-use std::io;
+use std::io::{self, Read, Write};
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -8,6 +8,21 @@ use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token};
 
 use crate::config::Config;
+
+/// One seated customer: their socket + the bytes they sent so far.
+/// (Early version of `Connection` in connection.rs.)
+struct Client {
+    stream: TcpStream,
+    buf: Vec<u8>,
+}
+
+/// Temporary (1d): the same answer for every request.
+const RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\n\
+Content-Type: text/plain\r\n\
+Content-Length: 5\r\n\
+Connection: close\r\n\
+\r\n\
+hello";
 
 pub fn run(config: Config) -> io::Result<()> {
     let mut poll = Poll::new()?;
@@ -33,8 +48,7 @@ pub fn run(config: Config) -> io::Result<()> {
     }
 
     // ── 1b: the seating chart ────────────────────────────────────────
-    // Tokens 0..listeners.len() belong to listeners, so clients start after.
-    let mut connections: HashMap<Token, TcpStream> = HashMap::new();
+    let mut connections: HashMap<Token, Client> = HashMap::new();
     let mut next_token = listeners.len();
 
     loop {
@@ -49,7 +63,7 @@ pub fn run(config: Config) -> io::Result<()> {
             let token = event.token();
 
             if token.0 < listeners.len() {
-                // A listener rang: seat EVERY waiting client (edge-triggered).
+                // ── 1b: a listener rang, seat every waiting client ──
                 loop {
                     match listeners[token.0].accept() {
                         Ok((mut stream, addr)) => {
@@ -62,17 +76,20 @@ pub fn run(config: Config) -> io::Result<()> {
                                 Interest::READABLE | Interest::WRITABLE,
                             ) {
                                 eprintln!("register error: {e}");
-                                continue; // `stream` is dropped here = socket closed
+                                continue; // stream dropped here = socket closed
                             }
 
                             println!("new client {addr} -> {client_token:?}");
-                            connections.insert(client_token, stream);
+                            connections.insert(
+                                client_token,
+                                Client {
+                                    stream,
+                                    buf: Vec::new(),
+                                },
+                            );
                         }
-                        // The door queue is empty: done for now.
                         Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                        // A signal interrupted accept(): just try again.
                         Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                        // Anything else: report it, but never crash.
                         Err(e) => {
                             eprintln!("accept error: {e}");
                             break;
@@ -80,13 +97,58 @@ pub fn run(config: Config) -> io::Result<()> {
                     }
                 }
             } else {
-                // A client rang. Reading comes in 1c.
-                println!(
-                    "client event on {:?} (readable: {}, writable: {})",
-                    token,
-                    event.is_readable(),
-                    event.is_writable()
-                );
+                // ── 1c: a client rang, read what it sent ────────────
+                let mut close = false;
+
+                let client = match connections.get_mut(&token) {
+                    Some(c) => c,
+                    None => continue,
+                };
+
+                if event.is_readable() {
+                    let mut tmp = [0u8; 4096];
+                    loop {
+                        match client.stream.read(&mut tmp) {
+                            Ok(0) => {
+                                close = true;
+                                break;
+                            }
+                            Ok(n) => client.buf.extend_from_slice(&tmp[..n]),
+                            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                            Err(e) => {
+                                eprintln!("read error on {token:?}: {e}");
+                                close = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    if !client.buf.is_empty() {
+                        println!(
+                            "--- {:?} has {} bytes ---\n{}",
+                            token,
+                            client.buf.len(),
+                            String::from_utf8_lossy(&client.buf)
+                        );
+                    }
+                }
+
+                // ── 1d (temporary): answer once the head is complete ─
+                if !close && client.buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match client.stream.write(RESPONSE) {
+                        Ok(n) => println!("answered {token:?} ({n} bytes)"),
+                        Err(e) => eprintln!("write error on {token:?}: {e}"),
+                    }
+                    close = true; // Connection: close → we hang up after answering
+                }
+
+                if close {
+                    if let Some(mut gone) = connections.remove(&token) {
+                        let _ = poll.registry().deregister(&mut gone.stream);
+                    }
+                    println!("client {token:?} left");
+                }
             }
         }
     }
