@@ -4,32 +4,33 @@ use std::time::Instant;
 
 use mio::net::TcpStream;
 
+use crate::http::parser::RequestHead;
+
+/// Bytes read per `fill()` call.
+const READ_CHUNK: usize = 64 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
-    /// Collecting the request.
     Reading,
-    /// Sending the response from `write_buf`.
     Writing,
 }
 
-/// What one `fill()` call found.
 pub enum ReadOutcome {
-    /// New bytes were added to `read_buf`.
     Data,
-    /// Nothing more to read right now.
     WouldBlock,
-    /// The client hung up, or the connection broke.
     Closed,
 }
 
-/// What one `flush()` call managed.
 pub enum WriteOutcome {
-    /// The whole `write_buf` has been sent.
     Done,
-    /// The socket is full: continue on the next WRITABLE event.
     WouldBlock,
-    /// The connection broke.
     Error,
+}
+
+/// A request whose head is parsed, waiting for its body.
+pub struct Pending {
+    pub head: RequestHead,
+    pub body_len: usize,
 }
 
 pub struct Connection {
@@ -37,10 +38,10 @@ pub struct Connection {
     pub state: State,
     pub read_buf: Vec<u8>,
     pub write_buf: Vec<u8>,
-    /// How many bytes of `write_buf` are already sent.
     pub written: usize,
     pub close_after_write: bool,
-    /// Used for timeouts in Step 3.
+    /// Head already parsed (so we never parse it twice).
+    pub pending: Option<Pending>,
     pub last_activity: Instant,
 }
 
@@ -53,33 +54,25 @@ impl Connection {
             write_buf: Vec::new(),
             written: 0,
             close_after_write: false,
+            pending: None,
             last_activity: Instant::now(),
         }
     }
 
     /// Reads ONE chunk from the socket into `read_buf`.
-    /// The caller loops: check the buffer, fill, check again...
     pub fn fill(&mut self) -> ReadOutcome {
-        let mut tmp = [0u8; 4096];
+        let mut tmp = [0u8; READ_CHUNK];
         loop {
             match self.stream.read(&mut tmp) {
-                Ok(0) => {
-                    return ReadOutcome::Closed;
-                }
+                Ok(0) => return ReadOutcome::Closed,
                 Ok(n) => {
                     self.read_buf.extend_from_slice(&tmp[..n]);
                     self.last_activity = Instant::now();
                     return ReadOutcome::Data;
                 }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    return ReadOutcome::WouldBlock;
-                }
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {
-                    continue;
-                }
-                Err(_) => {
-                    return ReadOutcome::Closed;
-                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return ReadOutcome::WouldBlock,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => return ReadOutcome::Closed,
             }
         }
     }
@@ -88,22 +81,14 @@ impl Connection {
     pub fn flush(&mut self) -> WriteOutcome {
         while self.written < self.write_buf.len() {
             match self.stream.write(&self.write_buf[self.written..]) {
-                Ok(0) => {
-                    return WriteOutcome::Error;
-                }
+                Ok(0) => return WriteOutcome::Error,
                 Ok(n) => {
                     self.written += n;
                     self.last_activity = Instant::now();
                 }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    return WriteOutcome::WouldBlock;
-                }
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {
-                    continue;
-                }
-                Err(_) => {
-                    return WriteOutcome::Error;
-                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return WriteOutcome::WouldBlock,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => return WriteOutcome::Error,
             }
         }
         WriteOutcome::Done

@@ -2,7 +2,7 @@
 //! The body is handled in 2c, once we know the server's body limit.
 use std::collections::HashMap;
 
-use super::Method;
+use super::{Method, Request};
 
 /// A head bigger than this is refused (protects memory).
 pub const MAX_HEAD_SIZE: usize = 16 * 1024;
@@ -46,6 +46,17 @@ impl RequestHead {
         self.headers
             .get(&name.to_ascii_lowercase())
             .map(|s| s.as_str())
+    }
+    /// Head + body -> the shared `Request` type (consumes the head).
+    pub fn into_request(self, body: Vec<u8>) -> Request {
+        Request {
+            method: self.method,
+            path: self.path,
+            query: self.query,
+            version: self.version,
+            headers: self.headers,
+            body,
+        }
     }
 }
 
@@ -105,6 +116,54 @@ pub fn parse_head(buf: &[u8]) -> Result<Option<RequestHead>, ParseError> {
         headers,
         head_len: end + 4,
     }))
+}
+
+/// How the body is framed, decided from the headers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BodyKind {
+    /// No body (a normal GET).
+    None,
+    /// Exactly this many bytes follow the head.
+    Length(usize),
+    /// Transfer-Encoding: chunked (Step 4).
+    Chunked,
+}
+
+pub fn body_kind(head: &RequestHead) -> Result<BodyKind, ParseError> {
+    match (
+        head.header("transfer-encoding"),
+        head.header("content-length"),
+    ) {
+        // Both at once = classic request-smuggling trick: refuse.
+        (Some(_), Some(_)) => Err(ParseError::BadRequest),
+        (Some(te), None) => {
+            if te.trim().eq_ignore_ascii_case("chunked") {
+                Ok(BodyKind::Chunked)
+            } else {
+                Err(ParseError::BadRequest)
+            }
+        }
+        (None, Some(cl)) => parse_content_length(cl).map(BodyKind::Length),
+        (None, None) => Ok(BodyKind::None),
+    }
+}
+
+/// "5" -> 5. A repeated header arrives joined ("5, 5"): all copies must agree.
+fn parse_content_length(value: &str) -> Result<usize, ParseError> {
+    let mut result: Option<usize> = None;
+    for part in value.split(',') {
+        let p = part.trim();
+        if p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(ParseError::BadRequest);
+        }
+        // parse() also fails on numbers too big for usize.
+        let n: usize = p.parse().map_err(|_| ParseError::BadRequest)?;
+        match result {
+            Some(previous) if previous != n => return Err(ParseError::BadRequest),
+            _ => result = Some(n),
+        }
+    }
+    result.ok_or(ParseError::BadRequest)
 }
 
 type RequestLine = (Method, String, Option<String>, String);
@@ -243,5 +302,65 @@ mod tests {
         let mut raw = b"GET / HTTP/1.1\r\nHost: a\r\nX-Big: ".to_vec();
         raw.extend(std::iter::repeat(b'a').take(MAX_HEAD_SIZE + 10));
         assert_eq!(parse_head(&raw), Err(ParseError::BadRequest));
+    }
+
+    fn head_with(extra_headers: &str) -> RequestHead {
+        let raw = format!("POST /up HTTP/1.1\r\nHost: a\r\n{extra_headers}\r\n");
+        head(raw.as_bytes())
+    }
+
+    #[test]
+    fn body_kind_from_headers() {
+        assert_eq!(
+            body_kind(&head(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n")),
+            Ok(BodyKind::None)
+        );
+        assert_eq!(
+            body_kind(&head_with("Content-Length: 5\r\n")),
+            Ok(BodyKind::Length(5))
+        );
+        assert_eq!(
+            body_kind(&head_with("Content-Length: 0\r\n")),
+            Ok(BodyKind::Length(0))
+        );
+        assert_eq!(
+            body_kind(&head_with("Transfer-Encoding: chunked\r\n")),
+            Ok(BodyKind::Chunked)
+        );
+    }
+
+    #[test]
+    fn bad_body_framing_is_400() {
+        let cases = [
+            "Content-Length: abc\r\n",
+            "Content-Length: -5\r\n",
+            "Content-Length: 5\r\nContent-Length: 6\r\n",
+            "Content-Length: 99999999999999999999999\r\n",
+            "Transfer-Encoding: gzip\r\n",
+            "Content-Length: 5\r\nTransfer-Encoding: chunked\r\n",
+        ];
+        for extra in cases {
+            assert_eq!(
+                body_kind(&head_with(extra)),
+                Err(ParseError::BadRequest),
+                "for {extra:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn same_length_twice_is_fine() {
+        let h = head_with("Content-Length: 5\r\nContent-Length: 5\r\n");
+        assert_eq!(body_kind(&h), Ok(BodyKind::Length(5)));
+    }
+
+    #[test]
+    fn into_request_keeps_everything() {
+        let h = head_with("Content-Length: 5\r\n");
+        let req = h.into_request(b"hello".to_vec());
+        assert_eq!(req.method, Method::Post);
+        assert_eq!(req.path, "/up");
+        assert_eq!(req.body, b"hello");
+        assert_eq!(req.header("content-length"), Some("5"));
     }
 }

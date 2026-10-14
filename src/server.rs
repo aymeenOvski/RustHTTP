@@ -8,11 +8,9 @@ use mio::net::TcpListener;
 use mio::{Events, Interest, Poll, Token};
 
 use crate::config::Config;
-use crate::connection::{Connection, ReadOutcome, State, WriteOutcome};
-
-use crate::http::parser::parse_head;
-use crate::http::reason_phrase;
-
+use crate::connection::{Connection, Pending, ReadOutcome, State, WriteOutcome};
+use crate::http::parser::{BodyKind, RequestHead, body_kind, parse_head};
+use crate::http::{Request, reason_phrase};
 /// Temporary (2a): size of the fixed answer's body.
 /// 5 MB to test partial writes; set it to 5 to get a small answer back.
 const TEST_BODY_SIZE: usize = 5;
@@ -43,6 +41,12 @@ pub fn run(config: Config) -> io::Result<()> {
     let mut connections: HashMap<Token, Connection> = HashMap::new();
     let mut next_token = listeners.len();
     let response = test_response(); // built once, copied per request
+    // Step 3 will pick the server from the Host header; for now: the first one.
+    let max_body = config
+        .servers
+        .first()
+        .map(|s| s.client_max_body_size)
+        .unwrap_or(1_000_000);
 
     loop {
         if let Err(e) = poll.poll(&mut events, Some(Duration::from_millis(500))) {
@@ -86,7 +90,7 @@ pub fn run(config: Config) -> io::Result<()> {
             } else {
                 // ── a client rang: let its state machine move ───────
                 let keep_open = match connections.get_mut(&token) {
-                    Some(conn) => drive(token, conn, &response),
+                    Some(conn) => drive(token, conn, &response, max_body),
                     None => continue, // already closed: old event
                 };
 
@@ -103,30 +107,43 @@ pub fn run(config: Config) -> io::Result<()> {
 
 /// Moves one connection forward as far as possible WITHOUT waiting.
 /// Returns false when the connection must be closed.
-fn drive(token: Token, conn: &mut Connection, response: &[u8]) -> bool {
+fn drive(token: Token, conn: &mut Connection, response: &[u8], max_body: usize) -> bool {
     loop {
         match conn.state {
             State::Reading => {
-                match parse_head(&conn.read_buf) {
-                    Ok(Some(head)) => {
-                        println!(
-                            "{token:?}: {} {} query={:?} host={:?} ({} headers)",
-                            head.method,
-                            head.path,
-                            head.query,
-                            head.header("host"),
-                            head.headers.len()
-                        );
-                        conn.queue(response.to_vec(), true);
-                        continue; // write NOW
-                    }
-                    Ok(None) => {} // head not complete: read more below
-                    Err(e) => {
-                        println!("{token:?}: bad request -> {}", e.status());
-                        conn.queue(error_bytes(e.status()), true);
-                        continue; // send the error, then close
+                // 1. Head not parsed yet? Try now (only once per request).
+                if conn.pending.is_none() {
+                    match parse_head(&conn.read_buf) {
+                        Ok(Some(head)) => match body_length(&head, max_body) {
+                            Ok(body_len) => conn.pending = Some(Pending { head, body_len }),
+                            Err(status) => {
+                                println!("{token:?}: refused -> {status}");
+                                conn.queue(error_bytes(status), true);
+                                continue;
+                            }
+                        },
+                        Ok(None) => {} // head not complete yet
+                        Err(e) => {
+                            println!("{token:?}: bad request -> {}", e.status());
+                            conn.queue(error_bytes(e.status()), true);
+                            continue;
+                        }
                     }
                 }
+
+                // 2. Head known: has the whole body arrived?
+                if let Some(request) = take_request(conn) {
+                    println!(
+                        "{token:?}: {} {} body: {} bytes",
+                        request.method,
+                        request.path,
+                        request.body.len()
+                    );
+                    conn.queue(response.to_vec(), true);
+                    continue; // write NOW
+                }
+
+                // 3. Not complete: read one more chunk.
                 match conn.fill() {
                     ReadOutcome::Data => {}
                     ReadOutcome::WouldBlock => return true,
@@ -150,6 +167,33 @@ fn drive(token: Token, conn: &mut Connection, response: &[u8]) -> bool {
             },
         }
     }
+}
+
+/// How many body bytes to wait for, or which status to refuse with.
+fn body_length(head: &RequestHead, max_body: usize) -> Result<usize, u16> {
+    match body_kind(head) {
+        Ok(BodyKind::None) => Ok(0),
+        Ok(BodyKind::Length(n)) if n > max_body => Err(413), // before reading it!
+        Ok(BodyKind::Length(n)) => Ok(n),
+        Ok(BodyKind::Chunked) => Err(501), // Step 4
+        Err(e) => Err(e.status()),
+    }
+}
+
+/// If the whole request is in the buffer, takes it out and returns it.
+fn take_request(conn: &mut Connection) -> Option<Request> {
+    let needed = match &conn.pending {
+        Some(p) => p.head.head_len + p.body_len,
+        None => return None,
+    };
+    if conn.read_buf.len() < needed {
+        return None; // body still arriving
+    }
+    let pending = conn.pending.take()?;
+    let body = conn.read_buf[pending.head.head_len..needed].to_vec();
+    // Remove exactly this request; anything after it is the NEXT request (2e).
+    conn.read_buf.drain(..needed);
+    Some(pending.head.into_request(body))
 }
 
 /// Temporary until 2d (real error pages come from error.rs).
