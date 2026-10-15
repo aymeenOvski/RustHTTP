@@ -31,6 +31,8 @@ pub enum WriteOutcome {
 pub struct Pending {
     pub head: RequestHead,
     pub body_len: usize,
+    /// Index (in config.servers) of the virtual server chosen from Host.
+    pub server: usize,
 }
 
 pub struct Connection {
@@ -43,12 +45,15 @@ pub struct Connection {
     /// Head already parsed (so we never parse it twice).
     pub pending: Option<Pending>,
     pub last_activity: Instant,
+    /// Index of the listener that accepted this client.
+    pub listener: usize,
 }
 
 impl Connection {
-    pub fn new(stream: TcpStream) -> Self {
+    pub fn new(stream: TcpStream, listener: usize) -> Self {
         Connection {
             stream,
+            listener,
             state: State::Reading,
             read_buf: Vec::new(),
             write_buf: Vec::new(),

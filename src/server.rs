@@ -1,4 +1,4 @@
-//! Owner: Person A — mio event loop, listeners, timeouts.
+//! Owner: Person A — mio event loop, listeners, virtual hosts, timeouts.
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
@@ -19,35 +19,48 @@ pub fn run(config: Config) -> io::Result<()> {
     let mut poll = Poll::new()?;
     let mut events = Events::with_capacity(1024);
 
-    // ── listeners ────────────────────────────────────────────────────
-    let mut listeners: Vec<TcpListener> = Vec::new();
-
-    for server in &config.servers {
+    // ── 1. Group servers by address: one listener per host:port ─────
+    // e.g. 127.0.0.1:8080 → [0, 1]   127.0.0.1:8081 → [0]
+    let mut groups: Vec<(SocketAddr, Vec<usize>)> = Vec::new();
+    for (i, server) in config.servers.iter().enumerate() {
         for &port in &server.ports {
             let addr: SocketAddr = format!("{}:{}", server.host, port)
                 .parse()
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
 
-            let mut listener = TcpListener::bind(addr)?;
-            let token = Token(listeners.len());
-            poll.registry()
-                .register(&mut listener, token, Interest::READABLE)?;
-
-            println!("listening on http://{addr} ({token:?})");
-            listeners.push(listener);
+            match groups.iter_mut().find(|(a, _)| *a == addr) {
+                Some((_, list)) => {
+                    if !list.contains(&i) {
+                        list.push(i);
+                    }
+                }
+                None => groups.push((addr, vec![i])),
+            }
         }
     }
 
-    // Step 3 will pick the server from the Host header; for now: the first one.
-    let server = match config.servers.first() {
-        Some(s) => s,
-        None => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "no server in config",
-            ));
-        }
-    };
+    // ── 2. Bind one listener per group ──────────────────────────────
+    let mut listeners: Vec<TcpListener> = Vec::new();
+    // listener_servers[i] = the servers behind listener i
+    let mut listener_servers: Vec<Vec<usize>> = Vec::new();
+
+    for (addr, group) in groups {
+        let mut listener = TcpListener::bind(addr)?;
+        let token = Token(listeners.len());
+        poll.registry()
+            .register(&mut listener, token, Interest::READABLE)?;
+
+        println!("listening on http://{addr} ({token:?}) servers {group:?}");
+        listeners.push(listener);
+        listener_servers.push(group);
+    }
+
+    if listeners.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "no server in config",
+        ));
+    }
 
     let mut connections: HashMap<Token, Connection> = HashMap::new();
     let mut next_token = listeners.len();
@@ -81,7 +94,8 @@ pub fn run(config: Config) -> io::Result<()> {
                             }
 
                             println!("new client {addr} -> {client_token:?}");
-                            connections.insert(client_token, Connection::new(stream));
+                            // Remember the listener: it decides which servers apply.
+                            connections.insert(client_token, Connection::new(stream, token.0));
                         }
                         Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                         Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -94,7 +108,10 @@ pub fn run(config: Config) -> io::Result<()> {
             } else {
                 // ── a client rang: let its state machine move ───────
                 let keep_open = match connections.get_mut(&token) {
-                    Some(conn) => drive(token, conn, server),
+                    Some(conn) => {
+                        let group = &listener_servers[conn.listener];
+                        drive(token, conn, &config.servers, group)
+                    }
                     None => continue,
                 };
 
@@ -110,24 +127,38 @@ pub fn run(config: Config) -> io::Result<()> {
 }
 
 /// Moves one connection forward as far as possible WITHOUT waiting.
+/// `group` = the servers behind this connection's listener.
 /// Returns false when the connection must be closed.
-fn drive(token: Token, conn: &mut Connection, server: &ServerConfig) -> bool {
+fn drive(token: Token, conn: &mut Connection, servers: &[ServerConfig], group: &[usize]) -> bool {
     loop {
         match conn.state {
             State::Reading => {
                 // 1. Head not parsed yet? Try now (once per request).
                 if conn.pending.is_none() {
                     match parse_head(&conn.read_buf) {
-                        Ok(Some(head)) => match body_length(&head, server.client_max_body_size) {
-                            Ok(body_len) => conn.pending = Some(Pending { head, body_len }),
-                            Err(status) => {
-                                println!("{token:?}: refused -> {status}");
-                                conn.queue(error_bytes(status, server), true);
-                                continue;
+                        Ok(Some(head)) => {
+                            // Choose the virtual server, then apply ITS body limit.
+                            let index = select_server(servers, group, head.header("host"));
+                            let server = &servers[index];
+                            match body_length(&head, server.client_max_body_size) {
+                                Ok(body_len) => {
+                                    conn.pending = Some(Pending {
+                                        head,
+                                        body_len,
+                                        server: index,
+                                    })
+                                }
+                                Err(status) => {
+                                    println!("{token:?}: refused by server #{index} -> {status}");
+                                    conn.queue(error_bytes(status, server), true);
+                                    continue;
+                                }
                             }
-                        },
+                        }
                         Ok(None) => {}
                         Err(e) => {
+                            // No usable Host header: use the default server's error page.
+                            let server = &servers[default_server(servers, group)];
                             println!("{token:?}: bad request -> {}", e.status());
                             conn.queue(error_bytes(e.status(), server), true);
                             continue;
@@ -135,19 +166,21 @@ fn drive(token: Token, conn: &mut Connection, server: &ServerConfig) -> bool {
                     }
                 }
 
-                // 2. Whole request here? Hand it to the application.
-                if let Some(request) = take_request(conn) {
+                // 2. Whole request here? Hand it to the chosen server's router.
+                if let Some((request, index)) = take_request(conn) {
+                    let server = &servers[index];
                     let close = !wants_keep_alive(&request);
                     let response = run_router(&request, server);
                     println!(
-                        "{token:?}: {} {} -> {} ({})",
+                        "{token:?}: {} {} [server #{index} {:?}] -> {} ({})",
                         request.method,
                         request.path,
+                        server.server_names,
                         response.status,
                         if close { "close" } else { "keep-alive" }
                     );
                     conn.queue(finalize(response, close), close);
-                    continue; // write NOW
+                    continue;
                 }
 
                 // 3. Not complete: read one more chunk.
@@ -162,10 +195,7 @@ fn drive(token: Token, conn: &mut Connection, server: &ServerConfig) -> bool {
                     if conn.close_after_write {
                         return false;
                     }
-                    // Keep-alive: back to Reading, and LOOP (don't return):
-                    // a pipelined request may already be in read_buf, and
-                    // epoll will never wake us for bytes we already read.
-                    conn.finish_response();
+                    conn.finish_response(); // keep-alive: loop, maybe a pipelined request
                 }
                 WriteOutcome::WouldBlock => return true,
                 WriteOutcome::Error => return false,
@@ -174,8 +204,51 @@ fn drive(token: Token, conn: &mut Connection, server: &ServerConfig) -> bool {
     }
 }
 
-/// The boundary with Person B's code. A panic in there becomes a 500
-/// for this one request instead of killing the whole server.
+// ───────────────────────────── virtual hosts ────────────────────────────
+
+/// 1. Host matches a server_name in this group → that server.
+/// 2. Otherwise → the group's default server (see default_server).
+fn select_server(servers: &[ServerConfig], group: &[usize], host: Option<&str>) -> usize {
+    if let Some(host) = host {
+        let name = strip_port(host);
+        for &i in group {
+            if servers[i]
+                .server_names
+                .iter()
+                .any(|n| n.eq_ignore_ascii_case(name))
+            {
+                return i;
+            }
+        }
+    }
+    default_server(servers, group)
+}
+
+/// The server marked `default` in this group, else the first one.
+fn default_server(servers: &[ServerConfig], group: &[usize]) -> usize {
+    group
+        .iter()
+        .copied()
+        .find(|&i| servers[i].is_default)
+        .or_else(|| group.first().copied())
+        .unwrap_or(0)
+}
+
+/// "localhost:8080" → "localhost",  "[::1]:8080" → "::1",  "example.com" → "example.com"
+fn strip_port(host: &str) -> &str {
+    let host = host.trim();
+    if let Some(rest) = host.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or(rest);
+    }
+    match host.rsplit_once(':') {
+        Some((name, _)) => name,
+        None => host,
+    }
+}
+
+// ───────────────────────────── helpers ──────────────────────────────────
+
+/// The boundary with Person B's code: a panic becomes a 500 for this request.
 fn run_router(request: &Request, server: &ServerConfig) -> Response {
     match panic::catch_unwind(AssertUnwindSafe(|| router::handle(request, server))) {
         Ok(response) => response,
@@ -186,8 +259,7 @@ fn run_router(request: &Request, server: &ServerConfig) -> Response {
     }
 }
 
-/// Adds the connection-level headers (our job, not the router's) and
-/// turns the response into bytes.
+/// Adds the connection-level headers and turns the response into bytes.
 fn finalize(mut response: Response, close: bool) -> Vec<u8> {
     response
         .headers
@@ -198,7 +270,6 @@ fn finalize(mut response: Response, close: bool) -> Vec<u8> {
     serialize::to_bytes(&response)
 }
 
-/// An error page from error.rs, ready to send.
 fn error_bytes(status: u16, server: &ServerConfig) -> Vec<u8> {
     finalize(error_response(status, server), true)
 }
@@ -207,15 +278,16 @@ fn error_bytes(status: u16, server: &ServerConfig) -> Vec<u8> {
 fn body_length(head: &RequestHead, max_body: usize) -> Result<usize, u16> {
     match body_kind(head) {
         Ok(BodyKind::None) => Ok(0),
-        Ok(BodyKind::Length(n)) if n > max_body => Err(413), // before reading it!
+        Ok(BodyKind::Length(n)) if n > max_body => Err(413),
         Ok(BodyKind::Length(n)) => Ok(n),
         Ok(BodyKind::Chunked) => Err(501), // Step 4
         Err(e) => Err(e.status()),
     }
 }
 
-/// If the whole request is in the buffer, takes it out and returns it.
-fn take_request(conn: &mut Connection) -> Option<Request> {
+/// If the whole request is in the buffer, takes it out.
+/// Returns the request and the index of the server chosen for it.
+fn take_request(conn: &mut Connection) -> Option<(Request, usize)> {
     let needed = match &conn.pending {
         Some(p) => p.head.head_len + p.body_len,
         None => return None,
@@ -225,12 +297,10 @@ fn take_request(conn: &mut Connection) -> Option<Request> {
     }
     let pending = conn.pending.take()?;
     let body = conn.read_buf[pending.head.head_len..needed].to_vec();
-    conn.read_buf.drain(..needed); // what follows = the next request (2e)
-    Some(pending.head.into_request(body))
+    conn.read_buf.drain(..needed);
+    Some((pending.head.into_request(body), pending.server))
 }
 
-/// HTTP/1.1 keeps the connection open unless the client says "close";
-/// HTTP/1.0 closes it unless the client says "keep-alive".
 fn wants_keep_alive(request: &Request) -> bool {
     let words: Vec<String> = request
         .header("connection")
@@ -240,7 +310,6 @@ fn wants_keep_alive(request: &Request) -> bool {
                 .collect()
         })
         .unwrap_or_default();
-
     if words.iter().any(|w| w == "close") {
         return false;
     }
@@ -270,6 +339,14 @@ mod tests {
         }
     }
 
+    fn named(names: &[&str], is_default: bool) -> ServerConfig {
+        ServerConfig {
+            server_names: names.iter().map(|n| n.to_string()).collect(),
+            is_default,
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn keep_alive_rules() {
         assert!(wants_keep_alive(&request("HTTP/1.1", None)));
@@ -280,5 +357,32 @@ mod tests {
         )));
         assert!(!wants_keep_alive(&request("HTTP/1.0", None)));
         assert!(wants_keep_alive(&request("HTTP/1.0", Some("Keep-Alive"))));
+    }
+
+    #[test]
+    fn strips_port_from_host() {
+        assert_eq!(strip_port("localhost:8080"), "localhost");
+        assert_eq!(strip_port("example.com"), "example.com");
+        assert_eq!(strip_port("[::1]:8080"), "::1");
+        assert_eq!(strip_port(" test.local "), "test.local");
+    }
+
+    #[test]
+    fn picks_server_by_host() {
+        let servers = vec![
+            named(&["localhost"], false),
+            named(&["test.local"], true),
+            named(&["other.local"], false),
+        ];
+        let group = [0, 1]; // server 2 listens elsewhere
+
+        assert_eq!(select_server(&servers, &group, Some("localhost:8080")), 0);
+        assert_eq!(select_server(&servers, &group, Some("TEST.LOCAL")), 1);
+        // other.local exists, but not on this address → default of this group
+        assert_eq!(select_server(&servers, &group, Some("other.local")), 1);
+        assert_eq!(select_server(&servers, &group, Some("unknown")), 1);
+        assert_eq!(select_server(&servers, &group, None), 1);
+        // no default in the group → the first one
+        assert_eq!(select_server(&servers, &[0, 2], None), 0);
     }
 }

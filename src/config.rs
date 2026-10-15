@@ -42,19 +42,34 @@ pub fn load(path: &str) -> Result<Config, String> {
 /// Hardcoded config so everyone can work before the parser exists.
 pub fn dev_config() -> Config {
     Config {
-        servers: vec![ServerConfig {
-            host: "127.0.0.1".into(),
-            ports: vec![8080],
-            is_default: true,
-            client_max_body_size: 1_000_000,
-            routes: vec![RouteConfig {
-                path: "/".into(),
-                methods: vec![Method::Get, Method::Post, Method::Delete],
-                root: Some("./www".into()),
-                index: Some("index.html".into()),
+        servers: vec![
+            ServerConfig {
+                host: "127.0.0.1".into(),
+                ports: vec![8080],
+                is_default: true,
+                client_max_body_size: 1_000_000,
+                routes: vec![RouteConfig {
+                    path: "/".into(),
+                    methods: vec![Method::Get, Method::Post, Method::Delete],
+                    root: Some("./www".into()),
+                    index: Some("index.html".into()),
+                    ..Default::default()
+                }],
                 ..Default::default()
-            }],
-            ..Default::default()
-        }],
+            },
+            ServerConfig {
+                host: "127.0.0.1".into(),
+                ports: vec![8080],
+                server_names: vec!["test.local".into()],
+                client_max_body_size: 1024,
+                routes: vec![RouteConfig {
+                    path: "/".into(),
+                    methods: vec![Method::Get, Method::Post],
+                    root: Some("./www".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        ],
     }
 }
