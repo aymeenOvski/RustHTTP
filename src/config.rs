@@ -35,7 +35,7 @@ pub struct RouteConfig {
 }
 
 pub fn load(path: &str) -> Result<Config, String> {
-    let _ = path; // TODO(B): read file, parse, validate
+    let _ = path; // TODO(B): turn the config file (.yaml) into a strong Rust struct (Config).
     Ok(dev_config())
 }
 
