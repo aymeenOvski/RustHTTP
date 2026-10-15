@@ -2,24 +2,24 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
+use std::panic::{self, AssertUnwindSafe};
 use std::time::Duration;
 
 use mio::net::TcpListener;
 use mio::{Events, Interest, Poll, Token};
 
-use crate::config::Config;
+use crate::config::{Config, ServerConfig};
 use crate::connection::{Connection, Pending, ReadOutcome, State, WriteOutcome};
+use crate::error::error_response;
 use crate::http::parser::{BodyKind, RequestHead, body_kind, parse_head};
-use crate::http::{Request, reason_phrase};
-/// Temporary (2a): size of the fixed answer's body.
-/// 5 MB to test partial writes; set it to 5 to get a small answer back.
-const TEST_BODY_SIZE: usize = 5;
+use crate::http::{Request, Response, serialize};
+use crate::router;
 
 pub fn run(config: Config) -> io::Result<()> {
     let mut poll = Poll::new()?;
     let mut events = Events::with_capacity(1024);
 
-    // ── listeners (1a) ───────────────────────────────────────────────
+    // ── listeners ────────────────────────────────────────────────────
     let mut listeners: Vec<TcpListener> = Vec::new();
 
     for server in &config.servers {
@@ -38,15 +38,19 @@ pub fn run(config: Config) -> io::Result<()> {
         }
     }
 
+    // Step 3 will pick the server from the Host header; for now: the first one.
+    let server = match config.servers.first() {
+        Some(s) => s,
+        None => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "no server in config",
+            ));
+        }
+    };
+
     let mut connections: HashMap<Token, Connection> = HashMap::new();
     let mut next_token = listeners.len();
-    let response = test_response(); // built once, copied per request
-    // Step 3 will pick the server from the Host header; for now: the first one.
-    let max_body = config
-        .servers
-        .first()
-        .map(|s| s.client_max_body_size)
-        .unwrap_or(1_000_000);
 
     loop {
         if let Err(e) = poll.poll(&mut events, Some(Duration::from_millis(500))) {
@@ -60,7 +64,7 @@ pub fn run(config: Config) -> io::Result<()> {
             let token = event.token();
 
             if token.0 < listeners.len() {
-                // ── accept every waiting client (1b) ────────────────
+                // ── accept every waiting client ─────────────────────
                 loop {
                     match listeners[token.0].accept() {
                         Ok((mut stream, addr)) => {
@@ -90,14 +94,14 @@ pub fn run(config: Config) -> io::Result<()> {
             } else {
                 // ── a client rang: let its state machine move ───────
                 let keep_open = match connections.get_mut(&token) {
-                    Some(conn) => drive(token, conn, &response, max_body),
-                    None => continue, // already closed: old event
+                    Some(conn) => drive(token, conn, server),
+                    None => continue,
                 };
 
                 if !keep_open {
                     if let Some(mut gone) = connections.remove(&token) {
                         let _ = poll.registry().deregister(&mut gone.stream);
-                    } // dropped here = socket closed
+                    }
                     println!("client {token:?} closed");
                 }
             }
@@ -107,39 +111,42 @@ pub fn run(config: Config) -> io::Result<()> {
 
 /// Moves one connection forward as far as possible WITHOUT waiting.
 /// Returns false when the connection must be closed.
-fn drive(token: Token, conn: &mut Connection, response: &[u8], max_body: usize) -> bool {
+fn drive(token: Token, conn: &mut Connection, server: &ServerConfig) -> bool {
     loop {
         match conn.state {
             State::Reading => {
-                // 1. Head not parsed yet? Try now (only once per request).
+                // 1. Head not parsed yet? Try now (once per request).
                 if conn.pending.is_none() {
                     match parse_head(&conn.read_buf) {
-                        Ok(Some(head)) => match body_length(&head, max_body) {
+                        Ok(Some(head)) => match body_length(&head, server.client_max_body_size) {
                             Ok(body_len) => conn.pending = Some(Pending { head, body_len }),
                             Err(status) => {
                                 println!("{token:?}: refused -> {status}");
-                                conn.queue(error_bytes(status), true);
+                                conn.queue(error_bytes(status, server), true);
                                 continue;
                             }
                         },
-                        Ok(None) => {} // head not complete yet
+                        Ok(None) => {}
                         Err(e) => {
                             println!("{token:?}: bad request -> {}", e.status());
-                            conn.queue(error_bytes(e.status()), true);
+                            conn.queue(error_bytes(e.status(), server), true);
                             continue;
                         }
                     }
                 }
 
-                // 2. Head known: has the whole body arrived?
+                // 2. Whole request here? Hand it to the application.
                 if let Some(request) = take_request(conn) {
+                    let close = !wants_keep_alive(&request);
+                    let response = run_router(&request, server);
                     println!(
-                        "{token:?}: {} {} body: {} bytes",
+                        "{token:?}: {} {} -> {} ({})",
                         request.method,
                         request.path,
-                        request.body.len()
+                        response.status,
+                        if close { "close" } else { "keep-alive" }
                     );
-                    conn.queue(response.to_vec(), true);
+                    conn.queue(finalize(response, close), close);
                     continue; // write NOW
                 }
 
@@ -152,21 +159,48 @@ fn drive(token: Token, conn: &mut Connection, response: &[u8], max_body: usize) 
             }
             State::Writing => match conn.flush() {
                 WriteOutcome::Done => {
-                    println!("{token:?}: response fully sent ({} bytes)", conn.written);
-                    return false; // 2e: keep-alive goes here
+                    if conn.close_after_write {
+                        return false;
+                    }
+                    // Keep-alive: back to Reading, and LOOP (don't return):
+                    // a pipelined request may already be in read_buf, and
+                    // epoll will never wake us for bytes we already read.
+                    conn.finish_response();
                 }
-                WriteOutcome::WouldBlock => {
-                    println!(
-                        "{token:?}: sent {}/{} bytes, waiting for WRITABLE",
-                        conn.written,
-                        conn.write_buf.len()
-                    );
-                    return true;
-                }
+                WriteOutcome::WouldBlock => return true,
                 WriteOutcome::Error => return false,
             },
         }
     }
+}
+
+/// The boundary with Person B's code. A panic in there becomes a 500
+/// for this one request instead of killing the whole server.
+fn run_router(request: &Request, server: &ServerConfig) -> Response {
+    match panic::catch_unwind(AssertUnwindSafe(|| router::handle(request, server))) {
+        Ok(response) => response,
+        Err(_) => {
+            eprintln!("router panicked on {} {}", request.method, request.path);
+            error_response(500, server)
+        }
+    }
+}
+
+/// Adds the connection-level headers (our job, not the router's) and
+/// turns the response into bytes.
+fn finalize(mut response: Response, close: bool) -> Vec<u8> {
+    response
+        .headers
+        .retain(|(name, _)| !name.eq_ignore_ascii_case("connection"));
+    let response = response
+        .with_header("Server", "localserver")
+        .with_header("Connection", if close { "close" } else { "keep-alive" });
+    serialize::to_bytes(&response)
+}
+
+/// An error page from error.rs, ready to send.
+fn error_bytes(status: u16, server: &ServerConfig) -> Vec<u8> {
+    finalize(error_response(status, server), true)
 }
 
 /// How many body bytes to wait for, or which status to refuse with.
@@ -187,41 +221,64 @@ fn take_request(conn: &mut Connection) -> Option<Request> {
         None => return None,
     };
     if conn.read_buf.len() < needed {
-        return None; // body still arriving
+        return None;
     }
     let pending = conn.pending.take()?;
     let body = conn.read_buf[pending.head.head_len..needed].to_vec();
-    // Remove exactly this request; anything after it is the NEXT request (2e).
-    conn.read_buf.drain(..needed);
+    conn.read_buf.drain(..needed); // what follows = the next request (2e)
     Some(pending.head.into_request(body))
 }
 
-/// Temporary until 2d (real error pages come from error.rs).
-fn error_bytes(status: u16) -> Vec<u8> {
-    let reason = reason_phrase(status);
-    let body = format!("{status} {reason}\n");
-    format!(
-        "HTTP/1.1 {status} {reason}\r\n\
-         Content-Type: text/plain\r\n\
-         Content-Length: {}\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {body}",
-        body.len()
-    )
-    .into_bytes()
+/// HTTP/1.1 keeps the connection open unless the client says "close";
+/// HTTP/1.0 closes it unless the client says "keep-alive".
+fn wants_keep_alive(request: &Request) -> bool {
+    let words: Vec<String> = request
+        .header("connection")
+        .map(|v| {
+            v.split(',')
+                .map(|w| w.trim().to_ascii_lowercase())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if words.iter().any(|w| w == "close") {
+        return false;
+    }
+    if words.iter().any(|w| w == "keep-alive") {
+        return true;
+    }
+    request.version == "HTTP/1.1"
 }
 
-/// Temporary (2a): a fixed answer of TEST_BODY_SIZE bytes of 'a'.
-fn test_response() -> Vec<u8> {
-    let mut out = format!(
-        "HTTP/1.1 200 OK\r\n\
-         Content-Type: text/plain\r\n\
-         Content-Length: {TEST_BODY_SIZE}\r\n\
-         Connection: close\r\n\
-         \r\n"
-    )
-    .into_bytes();
-    out.resize(out.len() + TEST_BODY_SIZE, b'a');
-    out
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::http::Method;
+
+    fn request(version: &str, connection: Option<&str>) -> Request {
+        let mut headers = HashMap::new();
+        if let Some(value) = connection {
+            headers.insert("connection".to_string(), value.to_string());
+        }
+        Request {
+            method: Method::Get,
+            path: "/".into(),
+            query: None,
+            version: version.into(),
+            headers,
+            body: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn keep_alive_rules() {
+        assert!(wants_keep_alive(&request("HTTP/1.1", None)));
+        assert!(!wants_keep_alive(&request("HTTP/1.1", Some("close"))));
+        assert!(!wants_keep_alive(&request(
+            "HTTP/1.1",
+            Some("Upgrade, Close")
+        )));
+        assert!(!wants_keep_alive(&request("HTTP/1.0", None)));
+        assert!(wants_keep_alive(&request("HTTP/1.0", Some("Keep-Alive"))));
+    }
 }

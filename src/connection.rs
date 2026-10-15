@@ -101,4 +101,13 @@ impl Connection {
         self.close_after_write = close;
         self.state = State::Writing;
     }
+
+    /// After a keep-alive response: get ready for the next request.
+    /// `read_buf` is NOT cleared: it may already hold the next request.
+    pub fn finish_response(&mut self) {
+        self.write_buf = Vec::new();
+        self.written = 0;
+        self.close_after_write = false;
+        self.state = State::Reading;
+    }
 }
