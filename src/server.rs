@@ -9,18 +9,16 @@ use mio::net::TcpListener;
 use mio::{Events, Interest, Poll, Token};
 
 use crate::config::{Config, ServerConfig};
-use crate::connection::{Connection, Expired, Pending, ReadOutcome, State, WriteOutcome};
+use crate::connection::{
+    Connection, Expired, Pending, PendingBody, ReadOutcome, State, WriteOutcome,
+};
 use crate::error::error_response;
-use crate::http::parser::{BodyKind, RequestHead, body_kind, parse_head};
+use crate::http::parser::{BodyKind, ChunkedDecoder, RequestHead, body_kind, parse_head};
 use crate::http::{Request, Response, serialize};
 use crate::router;
 
-/// Max time a connection may stay idle, take to send one request,
-/// or go without write progress. Short for testing; ask Person B to add
-/// a `timeout` setting to the config, then read it from there.
 const TIMEOUT: Duration = Duration::from_secs(5);
 
-/// How often we look for expired connections.
 const SWEEP_EVERY: Duration = Duration::from_secs(1);
 
 pub fn run(config: Config) -> io::Result<()> {
@@ -73,8 +71,6 @@ pub fn run(config: Config) -> io::Result<()> {
     let mut last_sweep = Instant::now();
 
     loop {
-        // The 500 ms timeout guarantees we wake up for the sweep below,
-        // even when no client sends anything.
         if let Err(e) = poll.poll(&mut events, Some(Duration::from_millis(500))) {
             if e.kind() == io::ErrorKind::Interrupted {
                 continue;
@@ -164,7 +160,7 @@ fn sweep_timeouts(
         println!("{token:?} timed out ({why:?})");
 
         let keep_open = match why {
-            Expired::Idle | Expired::StalledWrite => false,
+            Expired::Idle | Expired::StalledWrite | Expired::DrainOver => false,
             Expired::StuckRequest => match connections.get_mut(&token) {
                 Some(conn) => {
                     let group = &listener_servers[conn.listener];
@@ -174,8 +170,6 @@ fn sweep_timeouts(
                     };
                     conn.pending = None;
                     conn.queue(error_bytes(408, &servers[index]), true);
-                    // Try to send the 408 right now. If the socket is full,
-                    // the StalledWrite rule closes it on a later sweep.
                     drive(token, conn, servers, group)
                 }
                 None => false,
@@ -194,19 +188,23 @@ fn drive(token: Token, conn: &mut Connection, servers: &[ServerConfig], group: &
     loop {
         match conn.state {
             State::Reading => {
-                // 1. Head not parsed yet? Try now (once per request).
                 if conn.pending.is_none() {
                     match parse_head(&conn.read_buf) {
                         Ok(Some(head)) => {
                             let index = select_server(servers, group, head.header("host"));
                             let server = &servers[index];
-                            match body_length(&head, server.client_max_body_size) {
-                                Ok(body_len) => {
+                            match body_plan(&head, server.client_max_body_size) {
+                                Ok(body) => {
+                                    let received = conn.read_buf.len() - head.head_len;
+                                    if should_send_continue(&head, &body, received) {
+                                        println!("{token:?}: 100 Continue");
+                                        conn.send_continue();
+                                    }
                                     conn.pending = Some(Pending {
                                         head,
-                                        body_len,
+                                        body,
                                         server: index,
-                                    })
+                                    });
                                 }
                                 Err(status) => {
                                     println!("{token:?}: refused by server #{index} -> {status}");
@@ -226,19 +224,29 @@ fn drive(token: Token, conn: &mut Connection, servers: &[ServerConfig], group: &
                 }
 
                 // 2. Whole request here? Hand it to the chosen server's router.
-                if let Some((request, index)) = take_request(conn) {
-                    let server = &servers[index];
-                    let close = !wants_keep_alive(&request);
-                    let response = run_router(&request, server);
-                    println!(
-                        "{token:?}: {} {} [server #{index}] -> {} ({})",
-                        request.method,
-                        request.path,
-                        response.status,
-                        if close { "close" } else { "keep-alive" }
-                    );
-                    conn.queue(finalize(response, close), close);
-                    continue;
+                match take_request(conn, servers) {
+                    Ok(Some((request, index))) => {
+                        let server = &servers[index];
+                        let close = !wants_keep_alive(&request);
+                        let response = run_router(&request, server);
+                        println!(
+                            "{token:?}: {} {} [server #{index}] body {} bytes -> {} ({})",
+                            request.method,
+                            request.path,
+                            request.body.len(),
+                            response.status,
+                            if close { "close" } else { "keep-alive" }
+                        );
+                        conn.queue(finalize(response, close), close);
+                        continue;
+                    }
+                    Ok(None) => {} // body still arriving
+                    Err((status, index)) => {
+                        // Broken chunked body (400) or too big (413).
+                        println!("{token:?}: bad body -> {status}");
+                        conn.queue(error_bytes(status, &servers[index]), true);
+                        continue;
+                    }
                 }
 
                 // 3. Not complete: read one more chunk.
@@ -251,12 +259,19 @@ fn drive(token: Token, conn: &mut Connection, servers: &[ServerConfig], group: &
             State::Writing => match conn.flush() {
                 WriteOutcome::Done => {
                     if conn.close_after_write {
-                        return false;
+                        // Don't drop the socket yet: a graceful close makes
+                        // sure the client can read what we just sent.
+                        conn.start_draining();
+                    } else {
+                        conn.finish_response();
                     }
-                    conn.finish_response();
                 }
                 WriteOutcome::WouldBlock => return true,
                 WriteOutcome::Error => return false,
+            },
+            State::Draining(_) => match conn.drain() {
+                ReadOutcome::WouldBlock => return true, // wait for the client to close
+                _ => return false,                      // it closed (or misbehaves): close now
             },
         }
     }
@@ -326,36 +341,72 @@ fn error_bytes(status: u16, server: &ServerConfig) -> Vec<u8> {
     finalize(error_response(status, server), true)
 }
 
-fn body_length(head: &RequestHead, max_body: usize) -> Result<usize, u16> {
+/// How to receive the body, or which status to refuse with right away.
+fn body_plan(head: &RequestHead, max_body: usize) -> Result<PendingBody, u16> {
     match body_kind(head) {
-        Ok(BodyKind::None) => Ok(0),
-        Ok(BodyKind::Length(n)) if n > max_body => Err(413),
-        Ok(BodyKind::Length(n)) => Ok(n),
-        Ok(BodyKind::Chunked) => Err(501), // Step 4
+        Ok(BodyKind::None) => Ok(PendingBody::Length(0)),
+        Ok(BodyKind::Length(n)) if n > max_body => Err(413), // before reading it!
+        Ok(BodyKind::Length(n)) => Ok(PendingBody::Length(n)),
+        // The total size is unknown: the decoder checks the limit chunk by chunk.
+        Ok(BodyKind::Chunked) => Ok(PendingBody::Chunked(ChunkedDecoder::new())),
         Err(e) => Err(e.status()),
     }
 }
 
-/// If the whole request is in the buffer, takes it out.
-/// Returns the request and the index of the server chosen for it.
-fn take_request(conn: &mut Connection) -> Option<(Request, usize)> {
-    let needed = match &conn.pending {
-        Some(p) => p.head.head_len + p.body_len,
-        None => return None,
+/// Answer "Expect: 100-continue" only when it helps and is allowed:
+fn should_send_continue(head: &RequestHead, body: &PendingBody, received: usize) -> bool {
+    let asked = head
+        .header("expect")
+        .map(|v| v.trim().eq_ignore_ascii_case("100-continue"))
+        .unwrap_or(false);
+    let has_body = match body {
+        PendingBody::Length(n) => *n > 0,
+        PendingBody::Chunked(_) => true,
     };
-    if conn.read_buf.len() < needed {
-        return None;
-    }
-    let pending = conn.pending.take()?;
-    let body = conn.read_buf[pending.head.head_len..needed].to_vec();
-    conn.read_buf.drain(..needed);
-    // Leftover bytes = a pipelined request that has already started.
+    asked && head.version == "HTTP/1.1" && has_body && received == 0
+}
+
+fn take_request(
+    conn: &mut Connection,
+    servers: &[ServerConfig],
+) -> Result<Option<(Request, usize)>, (u16, usize)> {
+    let pending = match conn.pending.as_mut() {
+        Some(p) => p,
+        None => return Ok(None),
+    };
+    let start = pending.head.head_len;
+    let max_body = servers[pending.server].client_max_body_size;
+
+    // 1. Is the body complete? If yes: how many bytes does this request use?
+    let used = match &mut pending.body {
+        PendingBody::Length(n) => {
+            if conn.read_buf.len() < start + *n {
+                return Ok(None);
+            }
+            start + *n
+        }
+        PendingBody::Chunked(decoder) => match decoder.advance(&conn.read_buf[start..], max_body) {
+            Ok(true) => start + decoder.consumed(),
+            Ok(false) => return Ok(None),
+            Err(e) => return Err((e.status(), pending.server)),
+        },
+    };
+
+    // 2. Complete: take the request out.
+    let Some(pending) = conn.pending.take() else {
+        return Ok(None);
+    };
+    let body = match pending.body {
+        PendingBody::Length(_) => conn.read_buf[start..used].to_vec(),
+        PendingBody::Chunked(mut decoder) => decoder.take_body(),
+    };
+    conn.read_buf.drain(..used);
     conn.request_started = if conn.read_buf.is_empty() {
         None
     } else {
         Some(Instant::now())
     };
-    Some((pending.head.into_request(body), pending.server))
+    Ok(Some((pending.head.into_request(body), pending.server)))
 }
 
 fn wants_keep_alive(request: &Request) -> bool {
@@ -414,6 +465,46 @@ mod tests {
         )));
         assert!(!wants_keep_alive(&request("HTTP/1.0", None)));
         assert!(wants_keep_alive(&request("HTTP/1.0", Some("Keep-Alive"))));
+    }
+
+    fn planned(raw: &[u8]) -> (RequestHead, PendingBody) {
+        let head = match parse_head(raw) {
+            Ok(Some(h)) => h,
+            other => panic!("expected a head, got {other:?}"),
+        };
+        let body = match body_plan(&head, 1_000_000) {
+            Ok(b) => b,
+            Err(status) => panic!("refused with {status}"),
+        };
+        (head, body)
+    }
+
+    #[test]
+    fn continue_rules() {
+        let yes = |raw: &[u8], received: usize| {
+            let (head, body) = planned(raw);
+            should_send_continue(&head, &body, received)
+        };
+        let base = "POST /up HTTP/1.1\r\nHost: a\r\nContent-Length: 10\r\n";
+        let with = |extra: &str| format!("{base}{extra}\r\n");
+
+        assert!(yes(with("Expect: 100-continue\r\n").as_bytes(), 0));
+        assert!(yes(with("Expect: 100-Continue\r\n").as_bytes(), 0)); // any letter case
+        assert!(!yes(with("").as_bytes(), 0)); // not asked
+        assert!(!yes(with("Expect: something-else\r\n").as_bytes(), 0));
+        assert!(!yes(with("Expect: 100-continue\r\n").as_bytes(), 3)); // body already coming
+        assert!(!yes(
+            b"POST /up HTTP/1.0\r\nContent-Length: 10\r\nExpect: 100-continue\r\n\r\n",
+            0
+        )); // never to HTTP/1.0
+        assert!(!yes(
+            b"POST /up HTTP/1.1\r\nHost: a\r\nContent-Length: 0\r\nExpect: 100-continue\r\n\r\n",
+            0
+        )); // no body
+        assert!(yes(
+            b"POST /up HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\nExpect: 100-continue\r\n\r\n",
+            0
+        )); // chunked: size unknown, so yes
     }
 
     #[test]

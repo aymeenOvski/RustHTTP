@@ -14,7 +14,7 @@ pub fn to_bytes(resp: &Response) -> Vec<u8> {
     for (name, value) in &resp.headers {
         if name.eq_ignore_ascii_case("content-length") {
             if no_body {
-                continue; // not allowed on bodiless responses
+                continue;
             }
             has_length = true;
         }

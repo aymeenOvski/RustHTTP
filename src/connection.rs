@@ -1,18 +1,24 @@
 //! Owner: Person A — one client: its socket, its buffers, its state.
 use std::io::{self, Read, Write};
+use std::net::Shutdown;
 use std::time::{Duration, Instant};
 
 use mio::net::TcpStream;
 
-use crate::http::parser::RequestHead;
+use crate::http::parser::{ChunkedDecoder, RequestHead};
 
 /// Bytes read per `fill()` call.
 const READ_CHUNK: usize = 64 * 1024;
+
+pub const LINGER: Duration = Duration::from_secs(2);
+
+const MAX_DRAIN: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
     Reading,
     Writing,
+    Draining(Instant),
 }
 
 pub enum ReadOutcome {
@@ -27,7 +33,6 @@ pub enum WriteOutcome {
     Error,
 }
 
-/// Why a connection must be stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Expired {
     /// Waiting for a request, nothing received for too long → close.
@@ -36,12 +41,22 @@ pub enum Expired {
     StuckRequest,
     /// Sending, but the client stopped reading → close.
     StalledWrite,
+    /// Graceful close took longer than LINGER → close now.
+    DrainOver,
+}
+
+/// How the body of the pending request is being received.
+pub enum PendingBody {
+    /// Exactly this many bytes follow the head (0 = no body).
+    Length(usize),
+    /// Transfer-Encoding: chunked, decoded as the bytes arrive.
+    Chunked(ChunkedDecoder),
 }
 
 /// A request whose head is parsed, waiting for its body.
 pub struct Pending {
     pub head: RequestHead,
-    pub body_len: usize,
+    pub body: PendingBody,
     pub server: usize,
 }
 
@@ -59,6 +74,11 @@ pub struct Connection {
     /// When the first byte of the current request arrived.
     /// NOT reset by later bytes: this is what catches slowloris.
     pub request_started: Option<Instant>,
+    /// Bytes thrown away while Draining.
+    pub drained: usize,
+    /// Part of a "100 Continue" the socket did not accept (almost always
+    /// empty). It is sent first, right before the final response.
+    pub interim: Vec<u8>,
 }
 
 impl Connection {
@@ -74,6 +94,8 @@ impl Connection {
             pending: None,
             last_activity: Instant::now(),
             request_started: None,
+            drained: 0,
+            interim: Vec::new(),
         }
     }
 
@@ -117,9 +139,28 @@ impl Connection {
         WriteOutcome::Done
     }
 
+    /// Interim answer to "Expect: 100-continue": "you may send the body".
+    pub fn send_continue(&mut self) {
+        const CONTINUE: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
+        let sent = loop {
+            match self.stream.write(CONTINUE) {
+                Ok(n) => break n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => break 0, // WouldBlock or broken: keep it for later
+            }
+        };
+        self.interim.extend_from_slice(&CONTINUE[sent..]);
+    }
+
     /// Puts a full response in `write_buf` and switches to Writing.
     pub fn queue(&mut self, bytes: Vec<u8>, close: bool) {
-        self.write_buf = bytes;
+        self.write_buf = if self.interim.is_empty() {
+            bytes
+        } else {
+            let mut out = std::mem::take(&mut self.interim);
+            out.extend_from_slice(&bytes);
+            out
+        };
         self.written = 0;
         self.close_after_write = close;
         self.state = State::Writing;
@@ -133,6 +174,38 @@ impl Connection {
         self.written = 0;
         self.close_after_write = false;
         self.state = State::Reading;
+    }
+
+    /// Graceful close, step 1: tell the client "my response is complete"
+    /// (TCP FIN) and stop caring about its request.
+    pub fn start_draining(&mut self) {
+        let _ = self.stream.shutdown(Shutdown::Write);
+        self.state = State::Draining(Instant::now());
+        self.pending = None;
+        self.read_buf = Vec::new();
+        self.write_buf = Vec::new();
+        self.written = 0;
+    }
+
+    /// Graceful close, step 2: read and discard until the socket is empty.
+    /// WouldBlock → keep waiting for the client to close.
+    /// Closed     → close now (client closed, error, or too much data).
+    pub fn drain(&mut self) -> ReadOutcome {
+        let mut tmp = [0u8; READ_CHUNK];
+        loop {
+            match self.stream.read(&mut tmp) {
+                Ok(0) => return ReadOutcome::Closed,
+                Ok(n) => {
+                    self.drained += n;
+                    if self.drained > MAX_DRAIN {
+                        return ReadOutcome::Closed;
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return ReadOutcome::WouldBlock,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => return ReadOutcome::Closed,
+            }
+        }
     }
 
     /// Has this connection broken one of the timeout rules?
@@ -170,6 +243,10 @@ pub fn check_timeout(
         }
         // Nothing received: silent for too long?
         State::Reading => (now.duration_since(last_activity) > timeout).then_some(Expired::Idle),
+        // Graceful close: never longer than LINGER, even if bytes keep coming.
+        State::Draining(since) => {
+            (now.duration_since(since) > LINGER).then_some(Expired::DrainOver)
+        }
     }
 }
 
@@ -228,6 +305,21 @@ mod tests {
         assert_eq!(
             check_timeout(State::Writing, false, t0, None, t0 + secs(31), T),
             Some(Expired::StalledWrite)
+        );
+    }
+
+    #[test]
+    fn draining_is_limited_to_linger() {
+        let t0 = Instant::now();
+        let draining = State::Draining(t0);
+        // Bytes still arriving (last_activity recent) do not extend it.
+        assert_eq!(
+            check_timeout(draining, false, t0 + secs(1), None, t0 + secs(1), T),
+            None
+        );
+        assert_eq!(
+            check_timeout(draining, false, t0 + secs(3), None, t0 + secs(3), T),
+            Some(Expired::DrainOver)
         );
     }
 

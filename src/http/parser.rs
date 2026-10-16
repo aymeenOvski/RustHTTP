@@ -4,7 +4,6 @@ use std::collections::HashMap;
 
 use super::{Method, Request};
 
-/// A head bigger than this is refused (protects memory).
 pub const MAX_HEAD_SIZE: usize = 16 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +46,7 @@ impl RequestHead {
             .get(&name.to_ascii_lowercase())
             .map(|s| s.as_str())
     }
+
     /// Head + body -> the shared `Request` type (consumes the head).
     pub fn into_request(self, body: Vec<u8>) -> Request {
         Request {
@@ -164,6 +164,173 @@ fn parse_content_length(value: &str) -> Result<usize, ParseError> {
         }
     }
     result.ok_or(ParseError::BadRequest)
+}
+
+// ───────────────────────────── chunked bodies ───────────────────────────
+
+const MAX_CHUNK_LINE: usize = 1024;
+
+const MAX_TRAILERS: usize = 8 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChunkState {
+    /// Waiting for a size line like "1a\r\n".
+    Size,
+    /// This many data bytes of the current chunk are still missing.
+    Data(usize),
+    /// Waiting for the "\r\n" that ends a chunk's data.
+    DataEnd,
+    /// After the "0" chunk: header lines until an empty line.
+    Trailers,
+    /// The whole body has arrived.
+    Done,
+}
+
+/// Decodes a chunked body piece by piece, remembering where it stopped.
+#[derive(Debug)]
+pub struct ChunkedDecoder {
+    /// Position in `raw` (the bytes after the head) where we stopped.
+    pos: usize,
+    state: ChunkState,
+    /// The real body: chunk data only, no sizes, no "\r\n".
+    body: Vec<u8>,
+    trailer_bytes: usize,
+}
+
+impl ChunkedDecoder {
+    pub fn new() -> Self {
+        ChunkedDecoder {
+            pos: 0,
+            state: ChunkState::Size,
+            body: Vec::new(),
+            trailer_bytes: 0,
+        }
+    }
+
+    /// `raw` = every byte received after the head so far (it only grows).
+    /// Ok(true)  → the body is complete.
+    /// Ok(false) → need more bytes; call again when they arrive.
+    /// Err(e)    → broken (400) or too big (413).
+    pub fn advance(&mut self, raw: &[u8], max_body: usize) -> Result<bool, ParseError> {
+        loop {
+            match self.state {
+                ChunkState::Size => {
+                    let line_end = match find_newline(raw, self.pos) {
+                        Some(i) => i,
+                        None => {
+                            if raw.len() - self.pos > MAX_CHUNK_LINE {
+                                return Err(ParseError::BadRequest);
+                            }
+                            return Ok(false);
+                        }
+                    };
+                    if line_end - self.pos > MAX_CHUNK_LINE {
+                        return Err(ParseError::BadRequest);
+                    }
+                    let size = parse_chunk_size(&raw[self.pos..line_end])?;
+                    self.pos = line_end + 1;
+                    if size == 0 {
+                        self.state = ChunkState::Trailers;
+                    } else {
+                        // Check the limit BEFORE storing the chunk.
+                        if self.body.len().saturating_add(size) > max_body {
+                            return Err(ParseError::PayloadTooLarge);
+                        }
+                        self.state = ChunkState::Data(size);
+                    }
+                }
+                ChunkState::Data(missing) => {
+                    let available = raw.len() - self.pos;
+                    if available == 0 {
+                        return Ok(false);
+                    }
+                    let take = missing.min(available);
+                    self.body.extend_from_slice(&raw[self.pos..self.pos + take]);
+                    self.pos += take;
+                    if take < missing {
+                        self.state = ChunkState::Data(missing - take);
+                        return Ok(false);
+                    }
+                    self.state = ChunkState::DataEnd;
+                }
+                ChunkState::DataEnd => match raw.get(self.pos) {
+                    None => return Ok(false),
+                    Some(b'\n') => {
+                        self.pos += 1;
+                        self.state = ChunkState::Size;
+                    }
+                    Some(b'\r') => match raw.get(self.pos + 1) {
+                        None => return Ok(false),
+                        Some(b'\n') => {
+                            self.pos += 2;
+                            self.state = ChunkState::Size;
+                        }
+                        Some(_) => return Err(ParseError::BadRequest),
+                    },
+                    Some(_) => return Err(ParseError::BadRequest),
+                },
+                ChunkState::Trailers => {
+                    let line_end = match find_newline(raw, self.pos) {
+                        Some(i) => i,
+                        None => {
+                            if self.trailer_bytes + (raw.len() - self.pos) > MAX_TRAILERS {
+                                return Err(ParseError::BadRequest);
+                            }
+                            return Ok(false);
+                        }
+                    };
+                    let line = &raw[self.pos..line_end];
+                    self.pos = line_end + 1;
+                    if line.is_empty() || line == b"\r" {
+                        self.state = ChunkState::Done; // empty line = end of body
+                    } else {
+                        // A trailer header: accepted and ignored.
+                        self.trailer_bytes += line.len() + 1;
+                        if self.trailer_bytes > MAX_TRAILERS {
+                            return Err(ParseError::BadRequest);
+                        }
+                    }
+                }
+                ChunkState::Done => return Ok(true),
+            }
+        }
+    }
+
+    /// How many bytes of `raw` the chunked body used (sizes and "\r\n" included).
+    pub fn consumed(&self) -> usize {
+        self.pos
+    }
+
+    /// The decoded body. Call once `advance` returned Ok(true).
+    pub fn take_body(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.body)
+    }
+}
+
+/// "1a" / "1a;name=value" / "1a\r" -> 26
+fn parse_chunk_size(line: &[u8]) -> Result<usize, ParseError> {
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    // Chunk extensions (";name=value") are allowed and ignored.
+    let size_part = match line.iter().position(|&b| b == b';') {
+        Some(i) => &line[..i],
+        None => line,
+    };
+    let text = std::str::from_utf8(size_part)
+        .map_err(|_| ParseError::BadRequest)?
+        .trim_matches(|c| c == ' ' || c == '\t');
+    // At most 15 hex digits, so the number always fits in a usize.
+    if text.is_empty() || text.len() > 15 || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(ParseError::BadRequest);
+    }
+    usize::from_str_radix(text, 16).map_err(|_| ParseError::BadRequest)
+}
+
+/// Index of the next '\n' at or after `from`.
+fn find_newline(buf: &[u8], from: usize) -> Option<usize> {
+    buf[from..]
+        .iter()
+        .position(|&b| b == b'\n')
+        .map(|i| from + i)
 }
 
 type RequestLine = (Method, String, Option<String>, String);
@@ -362,5 +529,122 @@ mod tests {
         assert_eq!(req.path, "/up");
         assert_eq!(req.body, b"hello");
         assert_eq!(req.header("content-length"), Some("5"));
+    }
+
+    // ── chunked decoder ─────────────────────────────────────────────
+
+    /// Decodes a whole chunked body in one call.
+    fn decode(raw: &[u8], max: usize) -> Result<(Vec<u8>, usize), ParseError> {
+        let mut d = ChunkedDecoder::new();
+        match d.advance(raw, max)? {
+            true => Ok((d.take_body(), d.consumed())),
+            false => panic!("body not complete: {:?}", String::from_utf8_lossy(raw)),
+        }
+    }
+
+    #[test]
+    fn decodes_chunked_body() {
+        let raw = b"4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n";
+        assert_eq!(decode(raw, 1024), Ok((b"Wikipedia".to_vec(), raw.len())));
+    }
+
+    #[test]
+    fn hex_sizes() {
+        let mut raw = b"a\r\n0123456789\r\n10\r\n".to_vec();
+        raw.extend_from_slice(&[b'x'; 16]); // 0x10 = 16 bytes
+        raw.extend_from_slice(b"\r\n0\r\n\r\n");
+        let (body, _) = decode(&raw, 1024).unwrap();
+        assert_eq!(body.len(), 10 + 16);
+    }
+
+    #[test]
+    fn empty_chunked_body() {
+        assert_eq!(decode(b"0\r\n\r\n", 1024), Ok((Vec::new(), 5)));
+    }
+
+    #[test]
+    fn extensions_and_trailers_are_ignored() {
+        let raw = b"4;name=value\r\nWiki\r\n0\r\nX-Checksum: abc\r\nX-Other: 1\r\n\r\n";
+        assert_eq!(decode(raw, 1024), Ok((b"Wiki".to_vec(), raw.len())));
+    }
+
+    #[test]
+    fn works_when_bytes_arrive_one_by_one() {
+        let raw = b"3\r\nabc\r\na;x=1\r\n0123456789\r\n0\r\nT: 1\r\n\r\n";
+        let mut d = ChunkedDecoder::new();
+        for end in 1..raw.len() {
+            assert_eq!(
+                d.advance(&raw[..end], 1024),
+                Ok(false),
+                "finished too early at {end}"
+            );
+        }
+        assert_eq!(d.advance(raw, 1024), Ok(true));
+        assert_eq!(d.consumed(), raw.len());
+        assert_eq!(d.take_body(), b"abc0123456789");
+    }
+
+    #[test]
+    fn stops_at_the_end_of_the_body() {
+        // A pipelined request follows: it must NOT be eaten.
+        let body = b"2\r\nhi\r\n0\r\n\r\n";
+        let mut raw = body.to_vec();
+        raw.extend_from_slice(b"GET /next HTTP/1.1\r\n");
+        let (decoded, used) = decode(&raw, 1024).unwrap();
+        assert_eq!(decoded, b"hi");
+        assert_eq!(used, body.len());
+        assert_eq!(&raw[used..], b"GET /next HTTP/1.1\r\n");
+    }
+
+    #[test]
+    fn chunked_body_over_the_limit_is_413() {
+        let raw = b"6\r\nhello \r\n5\r\nworld\r\n0\r\n\r\n"; // 11 bytes
+        assert_eq!(decode(raw, 11).map(|(b, _)| b), Ok(b"hello world".to_vec()));
+        assert_eq!(decode(raw, 10), Err(ParseError::PayloadTooLarge));
+        // Refused from the size line alone, before the 1 GB "arrives".
+        let mut d = ChunkedDecoder::new();
+        assert_eq!(
+            d.advance(b"40000000\r\n", 1024),
+            Err(ParseError::PayloadTooLarge)
+        );
+    }
+
+    #[test]
+    fn malformed_chunks_are_400() {
+        let cases: Vec<&[u8]> = vec![
+            &b"zz\r\nhi\r\n0\r\n\r\n"[..], // not hex
+            &b"\r\nhi\r\n0\r\n\r\n"[..],   // empty size
+            &b"-2\r\nhi\r\n0\r\n\r\n"[..], // negative
+            &b"fffffffffffffffff\r\n"[..], // 17 digits: too long
+            &b"3\r\nabcXX0\r\n\r\n"[..],   // data not followed by \r\n
+            &b"3\r\nabc\rX"[..],           // \r not followed by \n
+        ];
+        for raw in cases {
+            let mut d = ChunkedDecoder::new();
+            assert_eq!(
+                d.advance(raw, 1024),
+                Err(ParseError::BadRequest),
+                "expected 400 for {:?}",
+                String::from_utf8_lossy(raw)
+            );
+        }
+    }
+
+    #[test]
+    fn endless_lines_are_400() {
+        let mut d = ChunkedDecoder::new();
+        let endless_size = vec![b'1'; MAX_CHUNK_LINE + 1];
+        assert_eq!(
+            d.advance(&endless_size, usize::MAX),
+            Err(ParseError::BadRequest)
+        );
+
+        let mut d = ChunkedDecoder::new();
+        let mut endless_trailer = b"0\r\nX-Big: ".to_vec();
+        endless_trailer.extend(std::iter::repeat(b'a').take(MAX_TRAILERS + 1));
+        assert_eq!(
+            d.advance(&endless_trailer, 1024),
+            Err(ParseError::BadRequest)
+        );
     }
 }
