@@ -47,7 +47,7 @@ pub fn dev_config() -> Config {
                 host: "127.0.0.1".into(),
                 ports: vec![8080],
                 is_default: true,
-                client_max_body_size: 1_000_000,
+                client_max_body_size: 100_000_000,
                 routes: vec![RouteConfig {
                     path: "/".into(),
                     methods: vec![Method::Get, Method::Post, Method::Delete],

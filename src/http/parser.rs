@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use super::{Method, Request};
 
+/// A head bigger than this is refused (protects memory).
 pub const MAX_HEAD_SIZE: usize = 16 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,9 +61,6 @@ impl RequestHead {
     }
 }
 
-/// Ok(None)        → the head is not complete yet, read more.
-/// Ok(Some(head))  → a complete, valid head.
-/// Err(e)          → a broken request, answer e.status() and close.
 pub fn parse_head(buf: &[u8]) -> Result<Option<RequestHead>, ParseError> {
     // 1. Find the empty line that ends the head.
     let end = match find(buf, b"\r\n\r\n") {
@@ -168,8 +166,9 @@ fn parse_content_length(value: &str) -> Result<usize, ParseError> {
 
 // ───────────────────────────── chunked bodies ───────────────────────────
 
+/// Longest allowed chunk-size line ("1a2b;ext=value\r\n").
 const MAX_CHUNK_LINE: usize = 1024;
-
+/// Most trailer bytes accepted after the last chunk.
 const MAX_TRAILERS: usize = 8 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -207,10 +206,6 @@ impl ChunkedDecoder {
         }
     }
 
-    /// `raw` = every byte received after the head so far (it only grows).
-    /// Ok(true)  → the body is complete.
-    /// Ok(false) → need more bytes; call again when they arrive.
-    /// Err(e)    → broken (400) or too big (413).
     pub fn advance(&mut self, raw: &[u8], max_body: usize) -> Result<bool, ParseError> {
         loop {
             match self.state {
@@ -232,7 +227,6 @@ impl ChunkedDecoder {
                     if size == 0 {
                         self.state = ChunkState::Trailers;
                     } else {
-                        // Check the limit BEFORE storing the chunk.
                         if self.body.len().saturating_add(size) > max_body {
                             return Err(ParseError::PayloadTooLarge);
                         }
@@ -282,9 +276,8 @@ impl ChunkedDecoder {
                     let line = &raw[self.pos..line_end];
                     self.pos = line_end + 1;
                     if line.is_empty() || line == b"\r" {
-                        self.state = ChunkState::Done; // empty line = end of body
+                        self.state = ChunkState::Done;
                     } else {
-                        // A trailer header: accepted and ignored.
                         self.trailer_bytes += line.len() + 1;
                         if self.trailer_bytes > MAX_TRAILERS {
                             return Err(ParseError::BadRequest);
@@ -296,9 +289,12 @@ impl ChunkedDecoder {
         }
     }
 
-    /// How many bytes of `raw` the chunked body used (sizes and "\r\n" included).
     pub fn consumed(&self) -> usize {
         self.pos
+    }
+
+    pub fn forget_consumed(&mut self) -> usize {
+        std::mem::take(&mut self.pos)
     }
 
     /// The decoded body. Call once `advance` returned Ok(true).
@@ -594,6 +590,32 @@ mod tests {
         assert_eq!(decoded, b"hi");
         assert_eq!(used, body.len());
         assert_eq!(&raw[used..], b"GET /next HTTP/1.1\r\n");
+    }
+
+    #[test]
+    fn forgetting_decoded_bytes_gives_the_same_body() {
+        let body_part = b"3\r\nabc\r\na;x=1\r\n0123456789\r\n0\r\nT: 1\r\n\r\n";
+        let mut input = body_part.to_vec();
+        input.extend_from_slice(b"GET /next");
+
+        let mut d = ChunkedDecoder::new();
+        let mut raw: Vec<u8> = Vec::new(); // plays the role of read_buf
+        let mut removed = 0;
+        let mut finished = false;
+        for piece in input.chunks(4) {
+            raw.extend_from_slice(piece);
+            if d.advance(&raw, 1024).unwrap() {
+                finished = true;
+                break;
+            }
+            let n = d.forget_consumed();
+            raw.drain(..n);
+            removed += n;
+            assert!(raw.len() <= 16, "decoded bytes must not pile up");
+        }
+        assert!(finished);
+        assert_eq!(d.take_body(), b"abc0123456789");
+        assert_eq!(removed + d.consumed(), body_part.len()); // ends exactly at the body's end
     }
 
     #[test]

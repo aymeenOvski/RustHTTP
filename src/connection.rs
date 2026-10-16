@@ -1,17 +1,17 @@
 //! Owner: Person A — one client: its socket, its buffers, its state.
-use std::io::{self, Read, Write};
+use std::io::{self, IoSlice, Read, Write};
 use std::net::Shutdown;
 use std::time::{Duration, Instant};
 
 use mio::net::TcpStream;
 
 use crate::http::parser::{ChunkedDecoder, RequestHead};
+use crate::http::serialize::Wire;
 
 /// Bytes read per `fill()` call.
 const READ_CHUNK: usize = 64 * 1024;
 
 pub const LINGER: Duration = Duration::from_secs(2);
-
 const MAX_DRAIN: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,19 +65,14 @@ pub struct Connection {
     pub listener: usize,
     pub state: State,
     pub read_buf: Vec<u8>,
-    pub write_buf: Vec<u8>,
+    pub out_head: Vec<u8>,
+    pub out_body: Vec<u8>,
     pub written: usize,
     pub close_after_write: bool,
     pub pending: Option<Pending>,
-    /// Last time a byte was read or written. Reset by every byte.
     pub last_activity: Instant,
-    /// When the first byte of the current request arrived.
-    /// NOT reset by later bytes: this is what catches slowloris.
     pub request_started: Option<Instant>,
-    /// Bytes thrown away while Draining.
     pub drained: usize,
-    /// Part of a "100 Continue" the socket did not accept (almost always
-    /// empty). It is sent first, right before the final response.
     pub interim: Vec<u8>,
 }
 
@@ -88,7 +83,8 @@ impl Connection {
             listener,
             state: State::Reading,
             read_buf: Vec::new(),
-            write_buf: Vec::new(),
+            out_head: Vec::new(),
+            out_body: Vec::new(),
             written: 0,
             close_after_write: false,
             pending: None,
@@ -108,7 +104,6 @@ impl Connection {
                 Ok(n) => {
                     let now = Instant::now();
                     if self.read_buf.is_empty() {
-                        // First byte of a new request: start its clock.
                         self.request_started = Some(now);
                     }
                     self.read_buf.extend_from_slice(&tmp[..n]);
@@ -122,10 +117,23 @@ impl Connection {
         }
     }
 
-    /// Sends as much of `write_buf` as the socket accepts right now.
+    /// Sends as much of the response (head, then body) as the socket accepts.
     pub fn flush(&mut self) -> WriteOutcome {
-        while self.written < self.write_buf.len() {
-            match self.stream.write(&self.write_buf[self.written..]) {
+        loop {
+            let head_len = self.out_head.len();
+            if self.written >= head_len + self.out_body.len() {
+                return WriteOutcome::Done;
+            }
+            let result = if self.written < head_len {
+                let parts = [
+                    IoSlice::new(&self.out_head[self.written..]),
+                    IoSlice::new(&self.out_body),
+                ];
+                self.stream.write_vectored(&parts)
+            } else {
+                self.stream.write(&self.out_body[self.written - head_len..])
+            };
+            match result {
                 Ok(0) => return WriteOutcome::Error,
                 Ok(n) => {
                     self.written += n;
@@ -136,10 +144,8 @@ impl Connection {
                 Err(_) => return WriteOutcome::Error,
             }
         }
-        WriteOutcome::Done
     }
 
-    /// Interim answer to "Expect: 100-continue": "you may send the body".
     pub fn send_continue(&mut self) {
         const CONTINUE: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
         let sent = loop {
@@ -152,49 +158,42 @@ impl Connection {
         self.interim.extend_from_slice(&CONTINUE[sent..]);
     }
 
-    /// Puts a full response in `write_buf` and switches to Writing.
-    pub fn queue(&mut self, bytes: Vec<u8>, close: bool) {
-        self.write_buf = if self.interim.is_empty() {
-            bytes
-        } else {
-            let mut out = std::mem::take(&mut self.interim);
-            out.extend_from_slice(&bytes);
-            out
-        };
+    /// Puts a response in the outgoing buffers and switches to Writing.
+    pub fn queue(&mut self, wire: Wire, close: bool) {
+        let mut head = std::mem::take(&mut self.interim);
+        head.extend_from_slice(&wire.head);
+        self.out_head = head;
+        self.out_body = wire.body;
         self.written = 0;
         self.close_after_write = close;
         self.state = State::Writing;
-        // A fresh window to send it: the stall clock starts now.
         self.last_activity = Instant::now();
     }
 
     /// After a keep-alive response: get ready for the next request.
     pub fn finish_response(&mut self) {
-        self.write_buf = Vec::new();
+        self.out_head = Vec::new();
+        self.out_body = Vec::new(); // the sent body is freed here
         self.written = 0;
         self.close_after_write = false;
         self.state = State::Reading;
     }
 
-    /// Graceful close, step 1: tell the client "my response is complete"
-    /// (TCP FIN) and stop caring about its request.
     pub fn start_draining(&mut self) {
         let _ = self.stream.shutdown(Shutdown::Write);
         self.state = State::Draining(Instant::now());
         self.pending = None;
-        self.read_buf = Vec::new();
-        self.write_buf = Vec::new();
+        self.read_buf = Vec::new(); // free the memory
+        self.out_head = Vec::new();
+        self.out_body = Vec::new();
         self.written = 0;
     }
 
-    /// Graceful close, step 2: read and discard until the socket is empty.
-    /// WouldBlock → keep waiting for the client to close.
-    /// Closed     → close now (client closed, error, or too much data).
     pub fn drain(&mut self) -> ReadOutcome {
         let mut tmp = [0u8; READ_CHUNK];
         loop {
             match self.stream.read(&mut tmp) {
-                Ok(0) => return ReadOutcome::Closed,
+                Ok(0) => return ReadOutcome::Closed, // the client closed: done
                 Ok(n) => {
                     self.drained += n;
                     if self.drained > MAX_DRAIN {

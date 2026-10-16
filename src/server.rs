@@ -14,7 +14,8 @@ use crate::connection::{
 };
 use crate::error::error_response;
 use crate::http::parser::{BodyKind, ChunkedDecoder, RequestHead, body_kind, parse_head};
-use crate::http::{Request, Response, serialize};
+use crate::http::serialize::{Wire, to_wire};
+use crate::http::{Request, Response};
 use crate::router;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -69,6 +70,7 @@ pub fn run(config: Config) -> io::Result<()> {
     let mut connections: HashMap<Token, Connection> = HashMap::new();
     let mut next_token = listeners.len();
     let mut last_sweep = Instant::now();
+    let mut accept_blocked: Vec<bool> = vec![false; listeners.len()];
 
     loop {
         if let Err(e) = poll.poll(&mut events, Some(Duration::from_millis(500))) {
@@ -78,43 +80,38 @@ pub fn run(config: Config) -> io::Result<()> {
             return Err(e);
         }
 
+        for index in 0..listeners.len() {
+            if accept_blocked[index] {
+                try_accept(
+                    index,
+                    &listeners,
+                    &poll,
+                    &mut connections,
+                    &mut next_token,
+                    &mut accept_blocked,
+                );
+            }
+        }
+
         for event in events.iter() {
             let token = event.token();
 
             if token.0 < listeners.len() {
                 // ── accept every waiting client ─────────────────────
-                loop {
-                    match listeners[token.0].accept() {
-                        Ok((mut stream, addr)) => {
-                            let client_token = Token(next_token);
-                            next_token += 1;
-
-                            if let Err(e) = poll.registry().register(
-                                &mut stream,
-                                client_token,
-                                Interest::READABLE | Interest::WRITABLE,
-                            ) {
-                                eprintln!("register error: {e}");
-                                continue;
-                            }
-
-                            println!("new client {addr} -> {client_token:?}");
-                            connections.insert(client_token, Connection::new(stream, token.0));
-                        }
-                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                        Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                        Err(e) => {
-                            eprintln!("accept error: {e}");
-                            break;
-                        }
-                    }
-                }
+                try_accept(
+                    token.0,
+                    &listeners,
+                    &poll,
+                    &mut connections,
+                    &mut next_token,
+                    &mut accept_blocked,
+                );
             } else {
                 // ── a client rang: let its state machine move ───────
                 let keep_open = match connections.get_mut(&token) {
                     Some(conn) => {
                         let group = &listener_servers[conn.listener];
-                        drive(token, conn, &config.servers, group)
+                        drive_safely(token, conn, &config.servers, group)
                     }
                     None => continue,
                 };
@@ -132,7 +129,77 @@ pub fn run(config: Config) -> io::Result<()> {
     }
 }
 
-/// Removes a connection: stop watching it, drop it (= close the socket).
+fn try_accept(
+    index: usize,
+    listeners: &[TcpListener],
+    poll: &Poll,
+    connections: &mut HashMap<Token, Connection>,
+    next_token: &mut usize,
+    accept_blocked: &mut [bool],
+) {
+    match accept_clients(index, &listeners[index], poll, connections, next_token) {
+        Ok(()) => {
+            if accept_blocked[index] {
+                println!("listener {index} accepting again");
+            }
+            accept_blocked[index] = false;
+        }
+        Err(e) => {
+            if !accept_blocked[index] {
+                eprintln!("accept error on listener {index}: {e} (will retry)");
+            }
+            accept_blocked[index] = true;
+        }
+    }
+}
+
+fn accept_clients(
+    index: usize,
+    listener: &TcpListener,
+    poll: &Poll,
+    connections: &mut HashMap<Token, Connection>,
+    next_token: &mut usize,
+) -> io::Result<()> {
+    loop {
+        match listener.accept() {
+            Ok((mut stream, addr)) => {
+                let client_token = Token(*next_token);
+                *next_token += 1;
+
+                if let Err(e) = poll.registry().register(
+                    &mut stream,
+                    client_token,
+                    Interest::READABLE | Interest::WRITABLE,
+                ) {
+                    eprintln!("register error: {e}");
+                    continue; // stream dropped here = socket closed
+                }
+
+                println!("new client {addr} -> {client_token:?}");
+                connections.insert(client_token, Connection::new(stream, index));
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+fn drive_safely(
+    token: Token,
+    conn: &mut Connection,
+    servers: &[ServerConfig],
+    group: &[usize],
+) -> bool {
+    match panic::catch_unwind(AssertUnwindSafe(|| drive(token, conn, servers, group))) {
+        Ok(keep_open) => keep_open,
+        Err(_) => {
+            eprintln!("{token:?}: internal error (panic), connection closed");
+            false
+        }
+    }
+}
+
 fn close_connection(token: Token, connections: &mut HashMap<Token, Connection>, poll: &Poll) {
     if let Some(mut gone) = connections.remove(&token) {
         let _ = poll.registry().deregister(&mut gone.stream);
@@ -140,7 +207,6 @@ fn close_connection(token: Token, connections: &mut HashMap<Token, Connection>, 
     }
 }
 
-/// Idle or stalled → close. Stuck request → send 408, then close.
 fn sweep_timeouts(
     connections: &mut HashMap<Token, Connection>,
     listener_servers: &[Vec<usize>],
@@ -169,8 +235,8 @@ fn sweep_timeouts(
                         None => default_server(servers, group),
                     };
                     conn.pending = None;
-                    conn.queue(error_bytes(408, &servers[index]), true);
-                    drive(token, conn, servers, group)
+                    conn.queue(error_wire(408, &servers[index]), true);
+                    drive_safely(token, conn, servers, group)
                 }
                 None => false,
             },
@@ -182,12 +248,11 @@ fn sweep_timeouts(
     }
 }
 
-/// Moves one connection forward as far as possible WITHOUT waiting.
-/// Returns false when the connection must be closed.
 fn drive(token: Token, conn: &mut Connection, servers: &[ServerConfig], group: &[usize]) -> bool {
     loop {
         match conn.state {
             State::Reading => {
+                // 1. Head not parsed yet? Try now (once per request).
                 if conn.pending.is_none() {
                     match parse_head(&conn.read_buf) {
                         Ok(Some(head)) => {
@@ -208,7 +273,7 @@ fn drive(token: Token, conn: &mut Connection, servers: &[ServerConfig], group: &
                                 }
                                 Err(status) => {
                                     println!("{token:?}: refused by server #{index} -> {status}");
-                                    conn.queue(error_bytes(status, server), true);
+                                    conn.queue(error_wire(status, server), true);
                                     continue;
                                 }
                             }
@@ -217,7 +282,7 @@ fn drive(token: Token, conn: &mut Connection, servers: &[ServerConfig], group: &
                         Err(e) => {
                             let server = &servers[default_server(servers, group)];
                             println!("{token:?}: bad request -> {}", e.status());
-                            conn.queue(error_bytes(e.status(), server), true);
+                            conn.queue(error_wire(e.status(), server), true);
                             continue;
                         }
                     }
@@ -244,7 +309,7 @@ fn drive(token: Token, conn: &mut Connection, servers: &[ServerConfig], group: &
                     Err((status, index)) => {
                         // Broken chunked body (400) or too big (413).
                         println!("{token:?}: bad body -> {status}");
-                        conn.queue(error_bytes(status, &servers[index]), true);
+                        conn.queue(error_wire(status, &servers[index]), true);
                         continue;
                     }
                 }
@@ -259,8 +324,6 @@ fn drive(token: Token, conn: &mut Connection, servers: &[ServerConfig], group: &
             State::Writing => match conn.flush() {
                 WriteOutcome::Done => {
                     if conn.close_after_write {
-                        // Don't drop the socket yet: a graceful close makes
-                        // sure the client can read what we just sent.
                         conn.start_draining();
                     } else {
                         conn.finish_response();
@@ -327,21 +390,20 @@ fn run_router(request: &Request, server: &ServerConfig) -> Response {
     }
 }
 
-fn finalize(mut response: Response, close: bool) -> Vec<u8> {
+fn finalize(mut response: Response, close: bool) -> Wire {
     response
         .headers
         .retain(|(name, _)| !name.eq_ignore_ascii_case("connection"));
     let response = response
         .with_header("Server", "localserver")
         .with_header("Connection", if close { "close" } else { "keep-alive" });
-    serialize::to_bytes(&response)
+    to_wire(response)
 }
 
-fn error_bytes(status: u16, server: &ServerConfig) -> Vec<u8> {
+fn error_wire(status: u16, server: &ServerConfig) -> Wire {
     finalize(error_response(status, server), true)
 }
 
-/// How to receive the body, or which status to refuse with right away.
 fn body_plan(head: &RequestHead, max_body: usize) -> Result<PendingBody, u16> {
     match body_kind(head) {
         Ok(BodyKind::None) => Ok(PendingBody::Length(0)),
@@ -353,7 +415,6 @@ fn body_plan(head: &RequestHead, max_body: usize) -> Result<PendingBody, u16> {
     }
 }
 
-/// Answer "Expect: 100-continue" only when it helps and is allowed:
 fn should_send_continue(head: &RequestHead, body: &PendingBody, received: usize) -> bool {
     let asked = head
         .header("expect")
@@ -387,7 +448,11 @@ fn take_request(
         }
         PendingBody::Chunked(decoder) => match decoder.advance(&conn.read_buf[start..], max_body) {
             Ok(true) => start + decoder.consumed(),
-            Ok(false) => return Ok(None),
+            Ok(false) => {
+                let done = decoder.forget_consumed();
+                conn.read_buf.drain(start..start + done);
+                return Ok(None);
+            }
             Err(e) => return Err((e.status(), pending.server)),
         },
     };
@@ -397,10 +462,21 @@ fn take_request(
         return Ok(None);
     };
     let body = match pending.body {
-        PendingBody::Length(_) => conn.read_buf[start..used].to_vec(),
-        PendingBody::Chunked(mut decoder) => decoder.take_body(),
+        PendingBody::Length(_) => {
+            // MOVE the body instead of copying it:
+            // 1. cut off what follows this request (usually nothing),
+            let next_request = conn.read_buf.split_off(used);
+            // 2. take the whole buffer out of the connection (no copy),
+            let mut bytes = std::mem::replace(&mut conn.read_buf, next_request);
+            // 3. drop the head: the body slides to the front, same memory.
+            bytes.drain(..start);
+            bytes
+        }
+        PendingBody::Chunked(mut decoder) => {
+            conn.read_buf.drain(..used); // what follows = the next request
+            decoder.take_body()
+        }
     };
-    conn.read_buf.drain(..used);
     conn.request_started = if conn.read_buf.is_empty() {
         None
     } else {
@@ -505,6 +581,60 @@ mod tests {
             b"POST /up HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\nExpect: 100-continue\r\n\r\n",
             0
         )); // chunked: size unknown, so yes
+    }
+
+    /// A Connection on a real (local) socket, for testing take_request.
+    fn test_connection(bytes: &[u8]) -> Connection {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let stream = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let mut conn = Connection::new(mio::net::TcpStream::from_std(stream), 0);
+        conn.read_buf = bytes.to_vec();
+        let head = parse_head(&conn.read_buf).unwrap().unwrap();
+        let body = body_plan(&head, 1024).unwrap();
+        conn.pending = Some(Pending {
+            head,
+            body,
+            server: 0,
+        });
+        conn
+    }
+
+    #[test]
+    fn body_is_moved_and_next_request_kept() {
+        let servers = vec![ServerConfig {
+            client_max_body_size: 1024,
+            ..Default::default()
+        }];
+        let mut conn = test_connection(
+            b"POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhelloGET /b HTTP/1.1\r\n",
+        );
+        let address = conn.read_buf.as_ptr(); // where the bytes were read into
+        let (request, server) = take_request(&mut conn, &servers).unwrap().unwrap();
+        assert_eq!(request.body, b"hello");
+        assert_eq!(server, 0);
+        assert_eq!(request.body.as_ptr(), address); // same memory: moved, not copied
+        assert_eq!(conn.read_buf, b"GET /b HTTP/1.1\r\n"); // pipelined request kept
+    }
+
+    #[test]
+    fn decoded_chunks_leave_read_buf() {
+        let servers = vec![ServerConfig {
+            client_max_body_size: 1024,
+            ..Default::default()
+        }];
+        let head = b"POST /a HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let mut first_part = head.to_vec();
+        first_part.extend_from_slice(b"5\r\nhello\r\n");
+        let mut conn = test_connection(&first_part);
+
+        // Not finished yet, but the decoded chunk is already gone from read_buf.
+        assert!(take_request(&mut conn, &servers).unwrap().is_none());
+        assert_eq!(conn.read_buf.len(), head.len());
+
+        conn.read_buf.extend_from_slice(b"0\r\n\r\nGET /b");
+        let (request, _) = take_request(&mut conn, &servers).unwrap().unwrap();
+        assert_eq!(request.body, b"hello");
+        assert_eq!(conn.read_buf, b"GET /b");
     }
 
     #[test]
