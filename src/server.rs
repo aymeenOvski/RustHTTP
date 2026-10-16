@@ -3,24 +3,31 @@ use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::panic::{self, AssertUnwindSafe};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use mio::net::TcpListener;
 use mio::{Events, Interest, Poll, Token};
 
 use crate::config::{Config, ServerConfig};
-use crate::connection::{Connection, Pending, ReadOutcome, State, WriteOutcome};
+use crate::connection::{Connection, Expired, Pending, ReadOutcome, State, WriteOutcome};
 use crate::error::error_response;
 use crate::http::parser::{BodyKind, RequestHead, body_kind, parse_head};
 use crate::http::{Request, Response, serialize};
 use crate::router;
+
+/// Max time a connection may stay idle, take to send one request,
+/// or go without write progress. Short for testing; ask Person B to add
+/// a `timeout` setting to the config, then read it from there.
+const TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How often we look for expired connections.
+const SWEEP_EVERY: Duration = Duration::from_secs(1);
 
 pub fn run(config: Config) -> io::Result<()> {
     let mut poll = Poll::new()?;
     let mut events = Events::with_capacity(1024);
 
     // ── 1. Group servers by address: one listener per host:port ─────
-    // e.g. 127.0.0.1:8080 → [0, 1]   127.0.0.1:8081 → [0]
     let mut groups: Vec<(SocketAddr, Vec<usize>)> = Vec::new();
     for (i, server) in config.servers.iter().enumerate() {
         for &port in &server.ports {
@@ -41,7 +48,6 @@ pub fn run(config: Config) -> io::Result<()> {
 
     // ── 2. Bind one listener per group ──────────────────────────────
     let mut listeners: Vec<TcpListener> = Vec::new();
-    // listener_servers[i] = the servers behind listener i
     let mut listener_servers: Vec<Vec<usize>> = Vec::new();
 
     for (addr, group) in groups {
@@ -64,8 +70,11 @@ pub fn run(config: Config) -> io::Result<()> {
 
     let mut connections: HashMap<Token, Connection> = HashMap::new();
     let mut next_token = listeners.len();
+    let mut last_sweep = Instant::now();
 
     loop {
+        // The 500 ms timeout guarantees we wake up for the sweep below,
+        // even when no client sends anything.
         if let Err(e) = poll.poll(&mut events, Some(Duration::from_millis(500))) {
             if e.kind() == io::ErrorKind::Interrupted {
                 continue;
@@ -94,7 +103,6 @@ pub fn run(config: Config) -> io::Result<()> {
                             }
 
                             println!("new client {addr} -> {client_token:?}");
-                            // Remember the listener: it decides which servers apply.
                             connections.insert(client_token, Connection::new(stream, token.0));
                         }
                         Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
@@ -114,20 +122,73 @@ pub fn run(config: Config) -> io::Result<()> {
                     }
                     None => continue,
                 };
-
                 if !keep_open {
-                    if let Some(mut gone) = connections.remove(&token) {
-                        let _ = poll.registry().deregister(&mut gone.stream);
-                    }
-                    println!("client {token:?} closed");
+                    close_connection(token, &mut connections, &poll);
                 }
             }
+        }
+
+        // ── about once a second: enforce the timeouts ───────────────
+        if last_sweep.elapsed() >= SWEEP_EVERY {
+            last_sweep = Instant::now();
+            sweep_timeouts(&mut connections, &listener_servers, &config.servers, &poll);
+        }
+    }
+}
+
+/// Removes a connection: stop watching it, drop it (= close the socket).
+fn close_connection(token: Token, connections: &mut HashMap<Token, Connection>, poll: &Poll) {
+    if let Some(mut gone) = connections.remove(&token) {
+        let _ = poll.registry().deregister(&mut gone.stream);
+        println!("client {token:?} closed");
+    }
+}
+
+/// Idle or stalled → close. Stuck request → send 408, then close.
+fn sweep_timeouts(
+    connections: &mut HashMap<Token, Connection>,
+    listener_servers: &[Vec<usize>],
+    servers: &[ServerConfig],
+    poll: &Poll,
+) {
+    let now = Instant::now();
+
+    // 1. Collect first: we can't remove from the map while iterating it.
+    let expired: Vec<(Token, Expired)> = connections
+        .iter()
+        .filter_map(|(token, conn)| conn.expired(now, TIMEOUT).map(|why| (*token, why)))
+        .collect();
+
+    // 2. Then act on each one.
+    for (token, why) in expired {
+        println!("{token:?} timed out ({why:?})");
+
+        let keep_open = match why {
+            Expired::Idle | Expired::StalledWrite => false,
+            Expired::StuckRequest => match connections.get_mut(&token) {
+                Some(conn) => {
+                    let group = &listener_servers[conn.listener];
+                    let index = match &conn.pending {
+                        Some(p) => p.server,
+                        None => default_server(servers, group),
+                    };
+                    conn.pending = None;
+                    conn.queue(error_bytes(408, &servers[index]), true);
+                    // Try to send the 408 right now. If the socket is full,
+                    // the StalledWrite rule closes it on a later sweep.
+                    drive(token, conn, servers, group)
+                }
+                None => false,
+            },
+        };
+
+        if !keep_open {
+            close_connection(token, connections, poll);
         }
     }
 }
 
 /// Moves one connection forward as far as possible WITHOUT waiting.
-/// `group` = the servers behind this connection's listener.
 /// Returns false when the connection must be closed.
 fn drive(token: Token, conn: &mut Connection, servers: &[ServerConfig], group: &[usize]) -> bool {
     loop {
@@ -137,7 +198,6 @@ fn drive(token: Token, conn: &mut Connection, servers: &[ServerConfig], group: &
                 if conn.pending.is_none() {
                     match parse_head(&conn.read_buf) {
                         Ok(Some(head)) => {
-                            // Choose the virtual server, then apply ITS body limit.
                             let index = select_server(servers, group, head.header("host"));
                             let server = &servers[index];
                             match body_length(&head, server.client_max_body_size) {
@@ -157,7 +217,6 @@ fn drive(token: Token, conn: &mut Connection, servers: &[ServerConfig], group: &
                         }
                         Ok(None) => {}
                         Err(e) => {
-                            // No usable Host header: use the default server's error page.
                             let server = &servers[default_server(servers, group)];
                             println!("{token:?}: bad request -> {}", e.status());
                             conn.queue(error_bytes(e.status(), server), true);
@@ -172,10 +231,9 @@ fn drive(token: Token, conn: &mut Connection, servers: &[ServerConfig], group: &
                     let close = !wants_keep_alive(&request);
                     let response = run_router(&request, server);
                     println!(
-                        "{token:?}: {} {} [server #{index} {:?}] -> {} ({})",
+                        "{token:?}: {} {} [server #{index}] -> {} ({})",
                         request.method,
                         request.path,
-                        server.server_names,
                         response.status,
                         if close { "close" } else { "keep-alive" }
                     );
@@ -195,7 +253,7 @@ fn drive(token: Token, conn: &mut Connection, servers: &[ServerConfig], group: &
                     if conn.close_after_write {
                         return false;
                     }
-                    conn.finish_response(); // keep-alive: loop, maybe a pipelined request
+                    conn.finish_response();
                 }
                 WriteOutcome::WouldBlock => return true,
                 WriteOutcome::Error => return false,
@@ -206,8 +264,6 @@ fn drive(token: Token, conn: &mut Connection, servers: &[ServerConfig], group: &
 
 // ───────────────────────────── virtual hosts ────────────────────────────
 
-/// 1. Host matches a server_name in this group → that server.
-/// 2. Otherwise → the group's default server (see default_server).
 fn select_server(servers: &[ServerConfig], group: &[usize], host: Option<&str>) -> usize {
     if let Some(host) = host {
         let name = strip_port(host);
@@ -224,7 +280,6 @@ fn select_server(servers: &[ServerConfig], group: &[usize], host: Option<&str>) 
     default_server(servers, group)
 }
 
-/// The server marked `default` in this group, else the first one.
 fn default_server(servers: &[ServerConfig], group: &[usize]) -> usize {
     group
         .iter()
@@ -234,7 +289,6 @@ fn default_server(servers: &[ServerConfig], group: &[usize]) -> usize {
         .unwrap_or(0)
 }
 
-/// "localhost:8080" → "localhost",  "[::1]:8080" → "::1",  "example.com" → "example.com"
 fn strip_port(host: &str) -> &str {
     let host = host.trim();
     if let Some(rest) = host.strip_prefix('[') {
@@ -248,7 +302,6 @@ fn strip_port(host: &str) -> &str {
 
 // ───────────────────────────── helpers ──────────────────────────────────
 
-/// The boundary with Person B's code: a panic becomes a 500 for this request.
 fn run_router(request: &Request, server: &ServerConfig) -> Response {
     match panic::catch_unwind(AssertUnwindSafe(|| router::handle(request, server))) {
         Ok(response) => response,
@@ -259,7 +312,6 @@ fn run_router(request: &Request, server: &ServerConfig) -> Response {
     }
 }
 
-/// Adds the connection-level headers and turns the response into bytes.
 fn finalize(mut response: Response, close: bool) -> Vec<u8> {
     response
         .headers
@@ -274,7 +326,6 @@ fn error_bytes(status: u16, server: &ServerConfig) -> Vec<u8> {
     finalize(error_response(status, server), true)
 }
 
-/// How many body bytes to wait for, or which status to refuse with.
 fn body_length(head: &RequestHead, max_body: usize) -> Result<usize, u16> {
     match body_kind(head) {
         Ok(BodyKind::None) => Ok(0),
@@ -298,6 +349,12 @@ fn take_request(conn: &mut Connection) -> Option<(Request, usize)> {
     let pending = conn.pending.take()?;
     let body = conn.read_buf[pending.head.head_len..needed].to_vec();
     conn.read_buf.drain(..needed);
+    // Leftover bytes = a pipelined request that has already started.
+    conn.request_started = if conn.read_buf.is_empty() {
+        None
+    } else {
+        Some(Instant::now())
+    };
     Some((pending.head.into_request(body), pending.server))
 }
 
@@ -374,15 +431,12 @@ mod tests {
             named(&["test.local"], true),
             named(&["other.local"], false),
         ];
-        let group = [0, 1]; // server 2 listens elsewhere
-
+        let group = [0, 1];
         assert_eq!(select_server(&servers, &group, Some("localhost:8080")), 0);
         assert_eq!(select_server(&servers, &group, Some("TEST.LOCAL")), 1);
-        // other.local exists, but not on this address → default of this group
         assert_eq!(select_server(&servers, &group, Some("other.local")), 1);
         assert_eq!(select_server(&servers, &group, Some("unknown")), 1);
         assert_eq!(select_server(&servers, &group, None), 1);
-        // no default in the group → the first one
         assert_eq!(select_server(&servers, &[0, 2], None), 0);
     }
 }
