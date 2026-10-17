@@ -53,7 +53,6 @@ pub fn load(path: &str) -> Result<Config, String> {
 
         // Handle section headers like [server.main] or [route.main./]
         if line.starts_with('[') && line.ends_with(']') {
-            // First, if we had an active route, push it to the current server
             if let Some(route) = current_route.take() {
                 if let Some(ref mut s) = current_server {
                     s.routes.push(route);
@@ -61,9 +60,10 @@ pub fn load(path: &str) -> Result<Config, String> {
             }
 
             let header = &line[1..line.len() - 1].trim();
+            
             let parts: Vec<&str> = header.splitn(3, '.').collect();
 
-            if parts[0] == "server" && parts.len() == 2 {
+            if parts.get(0) == Some(&"server") && parts.len() == 2 {
                 if let Some(s) = current_server.take() {
                     config.servers.push(s);
                 }
@@ -72,7 +72,7 @@ pub fn load(path: &str) -> Result<Config, String> {
                     client_max_body_size: 1_000_000,
                     ..Default::default()
                 });
-            } else if parts[0] == "route" && parts.len() >= 3 {
+            } else if parts.get(0) == Some(&"route") && parts.len() >= 3 {
                 section_type = "route";
                 current_route = Some(RouteConfig {
                     path: parts[2].to_string(),
@@ -93,7 +93,7 @@ pub fn load(path: &str) -> Result<Config, String> {
                         "host" => s.host = val.to_string(),
                         "ports" => {
                             s.ports = val.split(',')
-                                .map(|p| p.trim().parse::<u16>().unwrap_or(80))
+                                .map(|p| p.trim().parse::<u16>().unwrap_or(8080))
                                 .collect();
                         }
                         "server_names" => {
