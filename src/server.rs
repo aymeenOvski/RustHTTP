@@ -1,4 +1,8 @@
-//! Owner: Person A — mio event loop, listeners, virtual hosts, timeouts.
+//! the event loop: listeners, clients, virtual hosts, timeouts.
+//!
+//! One thread, one `Poll`. Listeners use tokens `0..listeners.len()`, clients
+//! use the tokens after. Each event moves one connection forward (`drive`)
+//! until its socket says `WouldBlock`, so no client can block the others.
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
@@ -18,15 +22,22 @@ use crate::http::serialize::{Wire, to_wire};
 use crate::http::{Request, Response};
 use crate::router;
 
+/// Max time a client may stay idle, take to send one request (then 408), or
+/// go without write progress.
 const TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How often expired connections are looked for.
 const SWEEP_EVERY: Duration = Duration::from_secs(1);
 
+/// Binds every address in the config and runs the event loop forever.
+/// Returns only on a startup error (bad address, bind failed, no server) or
+/// if `poll` itself fails.
 pub fn run(config: Config) -> io::Result<()> {
     let mut poll = Poll::new()?;
     let mut events = Events::with_capacity(1024);
 
     // ── 1. Group servers by address: one listener per host:port ─────
+    // Servers sharing an address are told apart later by `Host`.
     let mut groups: Vec<(SocketAddr, Vec<usize>)> = Vec::new();
     for (i, server) in config.servers.iter().enumerate() {
         for &port in &server.ports {
@@ -70,9 +81,12 @@ pub fn run(config: Config) -> io::Result<()> {
     let mut connections: HashMap<Token, Connection> = HashMap::new();
     let mut next_token = listeners.len();
     let mut last_sweep = Instant::now();
+    // accept_blocked[i]: accept() failed on listener i (e.g. too many open
+    // files). Its waiting clients send no new event, so we retry ourselves.
     let mut accept_blocked: Vec<bool> = vec![false; listeners.len()];
 
     loop {
+        // Wake up at least every 500 ms, so timeouts run even with no events.
         if let Err(e) = poll.poll(&mut events, Some(Duration::from_millis(500))) {
             if e.kind() == io::ErrorKind::Interrupted {
                 continue;
@@ -129,6 +143,8 @@ pub fn run(config: Config) -> io::Result<()> {
     }
 }
 
+/// Accepts on one listener and remembers whether it failed.
+/// Logs only when the state changes, not on every retry.
 fn try_accept(
     index: usize,
     listeners: &[TcpListener],
@@ -153,6 +169,9 @@ fn try_accept(
     }
 }
 
+/// Accepts clients until `WouldBlock`; each gets the next token and is
+/// watched for reading and writing. An accept error is returned; the clients
+/// not accepted yet stay in the kernel's queue.
 fn accept_clients(
     index: usize,
     listener: &TcpListener,
@@ -185,6 +204,8 @@ fn accept_clients(
     }
 }
 
+/// `drive`, but a panic closes only this connection, not the whole server.
+/// Returns false when the connection must be closed.
 fn drive_safely(
     token: Token,
     conn: &mut Connection,
@@ -200,6 +221,7 @@ fn drive_safely(
     }
 }
 
+/// Stops watching the client and drops it, which closes its socket.
 fn close_connection(token: Token, connections: &mut HashMap<Token, Connection>, poll: &Poll) {
     if let Some(mut gone) = connections.remove(&token) {
         let _ = poll.registry().deregister(&mut gone.stream);
@@ -207,6 +229,8 @@ fn close_connection(token: Token, connections: &mut HashMap<Token, Connection>, 
     }
 }
 
+/// Closes every connection that broke a timeout rule.
+/// A stuck request first gets a 408 response.
 fn sweep_timeouts(
     connections: &mut HashMap<Token, Connection>,
     listener_servers: &[Vec<usize>],
@@ -248,6 +272,16 @@ fn sweep_timeouts(
     }
 }
 
+/// Moves one connection forward until its socket says `WouldBlock`.
+///
+/// - Reading: parse the head, pick the server, plan the body, wait for the
+///   whole request, call the router, queue the response.
+/// - Writing: send; then close gracefully, or go back to Reading (keep-alive).
+/// - Draining: throw away input until the client closes.
+///
+/// It loops instead of returning after each step, so pipelined requests
+/// already in `read_buf` are answered without waiting for a new event.
+/// Returns false when the connection must be closed.
 fn drive(token: Token, conn: &mut Connection, servers: &[ServerConfig], group: &[usize]) -> bool {
     loop {
         match conn.state {
@@ -342,6 +376,8 @@ fn drive(token: Token, conn: &mut Connection, servers: &[ServerConfig], group: &
 
 // ───────────────────────────── virtual hosts ────────────────────────────
 
+/// The server of this group whose `server_names` match the `Host` header,
+/// otherwise the group's default.
 fn select_server(servers: &[ServerConfig], group: &[usize], host: Option<&str>) -> usize {
     if let Some(host) = host {
         let name = strip_port(host);
@@ -358,6 +394,7 @@ fn select_server(servers: &[ServerConfig], group: &[usize], host: Option<&str>) 
     default_server(servers, group)
 }
 
+/// The group's server marked `is_default`, otherwise the first one.
 fn default_server(servers: &[ServerConfig], group: &[usize]) -> usize {
     group
         .iter()
@@ -367,6 +404,7 @@ fn default_server(servers: &[ServerConfig], group: &[usize]) -> usize {
         .unwrap_or(0)
 }
 
+/// `example.com:8080` → `example.com`, `[::1]:8080` → `::1`.
 fn strip_port(host: &str) -> &str {
     let host = host.trim();
     if let Some(rest) = host.strip_prefix('[') {
@@ -380,6 +418,7 @@ fn strip_port(host: &str) -> &str {
 
 // ───────────────────────────── helpers ──────────────────────────────────
 
+/// Calls the router. A panic inside it becomes a 500 response.
 fn run_router(request: &Request, server: &ServerConfig) -> Response {
     match panic::catch_unwind(AssertUnwindSafe(|| router::handle(request, server))) {
         Ok(response) => response,
@@ -390,6 +429,9 @@ fn run_router(request: &Request, server: &ServerConfig) -> Response {
     }
 }
 
+/// Adds the `Server` and `Connection` headers, then builds the bytes.
+/// The router's own `Connection` header is replaced: keep-alive is decided
+/// here only.
 fn finalize(mut response: Response, close: bool) -> Wire {
     response
         .headers
@@ -400,10 +442,12 @@ fn finalize(mut response: Response, close: bool) -> Wire {
     to_wire(response)
 }
 
+/// The server's error page for `status`; the connection closes after it.
 fn error_wire(status: u16, server: &ServerConfig) -> Wire {
     finalize(error_response(status, server), true)
 }
 
+/// How to receive the body, or the status (400, 413) to answer right away.
 fn body_plan(head: &RequestHead, max_body: usize) -> Result<PendingBody, u16> {
     match body_kind(head) {
         Ok(BodyKind::None) => Ok(PendingBody::Length(0)),
@@ -415,6 +459,9 @@ fn body_plan(head: &RequestHead, max_body: usize) -> Result<PendingBody, u16> {
     }
 }
 
+/// True if the client waits for "100 Continue" before sending its body: it
+/// sent `Expect: 100-continue`, speaks HTTP/1.1, announced a body, and no
+/// body byte has arrived yet.
 fn should_send_continue(head: &RequestHead, body: &PendingBody, received: usize) -> bool {
     let asked = head
         .header("expect")
@@ -427,6 +474,14 @@ fn should_send_continue(head: &RequestHead, body: &PendingBody, received: usize)
     asked && head.version == "HTTP/1.1" && has_body && received == 0
 }
 
+/// Takes the pending request out of the connection once its body is complete.
+///
+/// - `Ok(Some((request, server)))`: complete. Bytes after it stay in
+///   `read_buf` (the next pipelined request).
+/// - `Ok(None)`: no head yet, or the body is still arriving.
+/// - `Err((status, server))`: broken chunked body (400) or too big (413).
+///
+/// Decoded chunks leave `read_buf` right away, so they are not kept twice.
 fn take_request(
     conn: &mut Connection,
     servers: &[ServerConfig],
@@ -477,6 +532,7 @@ fn take_request(
             decoder.take_body()
         }
     };
+    // The next request's clock starts now if its bytes are already here.
     conn.request_started = if conn.read_buf.is_empty() {
         None
     } else {
@@ -485,6 +541,8 @@ fn take_request(
     Ok(Some((pending.head.into_request(body), pending.server)))
 }
 
+/// `Connection: close` → close; `Connection: keep-alive` → keep.
+/// Otherwise HTTP/1.1 keeps the connection open and HTTP/1.0 closes it.
 fn wants_keep_alive(request: &Request) -> bool {
     let words: Vec<String> = request
         .header("connection")

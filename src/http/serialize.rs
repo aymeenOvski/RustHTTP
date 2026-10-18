@@ -1,15 +1,22 @@
-//! Owner: Person A — Response -> bytes on the wire.
+//! turns a `Response` into the bytes sent to the client.
 use super::{Response, reason_phrase};
 
+/// A response ready to send, kept in two parts so the body is never copied.
 pub struct Wire {
-    /// Status line + headers + the empty line.
+    /// Status line, headers and the empty line that ends them.
     pub head: Vec<u8>,
-    /// The body (empty for 1xx, 204 and 304).
+    /// The body, moved out of the `Response`. Empty for 1xx, 204 and 304.
     pub body: Vec<u8>,
 }
 
+/// Builds the bytes of a response.
+///
+/// - Adds `Content-Length` when the router did not set one.
+/// - 1xx, 204 and 304 get no body and no `Content-Length` (RFC 9110).
+/// - CR and LF are removed from header names and values.
+///
+/// Takes the `Response` by value so its body is moved, not copied.
 pub fn to_wire(resp: Response) -> Wire {
-    // 1xx, 204 and 304 never carry a body (RFC 9110).
     let no_body = (100..200).contains(&resp.status) || resp.status == 204 || resp.status == 304;
 
     let mut head = format!(
@@ -41,7 +48,7 @@ pub fn to_wire(resp: Response) -> Wire {
     }
 }
 
-/// Removes CR and LF so a header value can never inject extra headers.
+/// Removes CR and LF, so a header name or value can never add extra headers.
 fn clean(s: &str) -> String {
     s.chars().filter(|&c| c != '\r' && c != '\n').collect()
 }

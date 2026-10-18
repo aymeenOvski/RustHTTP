@@ -1,4 +1,8 @@
-//! Owner: Person A — one client: its socket, its buffers, its state.
+//! one client: its socket, its buffers, its state.
+//!
+//! The socket is non-blocking: any read or write can stop with `WouldBlock`.
+//! The connection keeps enough state (`read_buf`, `written`, `pending`) to
+//! continue exactly where it stopped on the next event.
 use std::io::{self, IoSlice, Read, Write};
 use std::net::Shutdown;
 use std::time::{Duration, Instant};
@@ -11,28 +15,43 @@ use crate::http::serialize::Wire;
 /// Bytes read per `fill()` call.
 const READ_CHUNK: usize = 64 * 1024;
 
+/// Longest time a graceful close may take.
 pub const LINGER: Duration = Duration::from_secs(2);
+/// Most bytes thrown away during a graceful close before cutting the client off.
 const MAX_DRAIN: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
+    /// Receiving a request, or waiting for the next one (keep-alive).
     Reading,
+    /// Sending a response.
     Writing,
+    /// Last response sent and our side shut down (FIN). Reads and throws away
+    /// what the client still sends until it closes, so closing does not send
+    /// a reset (RST) that could make the client lose the response.
+    /// Holds the time draining started.
     Draining(Instant),
 }
 
 pub enum ReadOutcome {
+    /// New bytes were added.
     Data,
+    /// Nothing to read now: wait for the next event.
     WouldBlock,
+    /// The client closed, or the socket failed.
     Closed,
 }
 
 pub enum WriteOutcome {
+    /// The whole response is in the kernel's send buffer.
     Done,
+    /// The send buffer is full: wait for WRITABLE.
     WouldBlock,
+    /// The socket failed: close the connection.
     Error,
 }
 
+/// Which timeout rule a connection broke.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Expired {
     /// Waiting for a request, nothing received for too long → close.
@@ -57,22 +76,36 @@ pub enum PendingBody {
 pub struct Pending {
     pub head: RequestHead,
     pub body: PendingBody,
+    /// Index (in the config) of the server chosen from the `Host` header.
     pub server: usize,
 }
 
 pub struct Connection {
     pub stream: TcpStream,
+    /// Index of the listener that accepted this client.
     pub listener: usize,
     pub state: State,
+    /// Bytes received and not yet used by a request.
     pub read_buf: Vec<u8>,
+    /// The response being sent: head, then body. Kept apart so the body is
+    /// never copied.
     pub out_head: Vec<u8>,
     pub out_body: Vec<u8>,
+    /// Bytes of head + body already sent.
     pub written: usize,
+    /// Close the connection once the response is sent.
     pub close_after_write: bool,
+    /// The request being received, once its head is parsed.
     pub pending: Option<Pending>,
+    /// Last time a byte was read or written.
     pub last_activity: Instant,
+    /// When the first byte of the current request arrived. Later bytes do not
+    /// move it: this is what catches slowloris.
     pub request_started: Option<Instant>,
+    /// Bytes thrown away while draining.
     pub drained: usize,
+    /// The part of "100 Continue" the socket did not accept (almost always
+    /// empty). Sent just before the final response.
     pub interim: Vec<u8>,
 }
 
@@ -96,6 +129,10 @@ impl Connection {
     }
 
     /// Reads ONE chunk from the socket into `read_buf`.
+    ///
+    /// One chunk only, so the caller checks the request (head, limits)
+    /// between reads instead of buffering everything first. The first byte of
+    /// a new request starts its clock (`request_started`).
     pub fn fill(&mut self) -> ReadOutcome {
         let mut tmp = [0u8; READ_CHUNK];
         loop {
@@ -118,6 +155,10 @@ impl Connection {
     }
 
     /// Sends as much of the response (head, then body) as the socket accepts.
+    ///
+    /// Continues from `written`. While part of the head is unsent, head and
+    /// body go out in one `write_vectored` call, so they leave together and
+    /// a small response is not delayed.
     pub fn flush(&mut self) -> WriteOutcome {
         loop {
             let head_len = self.out_head.len();
@@ -146,6 +187,8 @@ impl Connection {
         }
     }
 
+    /// Answers `Expect: 100-continue`: tells the client to send its body.
+    /// Whatever the socket does not accept now waits in `interim`.
     pub fn send_continue(&mut self) {
         const CONTINUE: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
         let sent = loop {
@@ -159,7 +202,9 @@ impl Connection {
     }
 
     /// Puts a response in the outgoing buffers and switches to Writing.
+    /// `close`: close the connection after sending it.
     pub fn queue(&mut self, wire: Wire, close: bool) {
+        // An unsent piece of "100 Continue" must go out first.
         let mut head = std::mem::take(&mut self.interim);
         head.extend_from_slice(&wire.head);
         self.out_head = head;
@@ -179,6 +224,8 @@ impl Connection {
         self.state = State::Reading;
     }
 
+    /// Starts the graceful close: sends FIN, frees the buffers, switches to
+    /// Draining.
     pub fn start_draining(&mut self) {
         let _ = self.stream.shutdown(Shutdown::Write);
         self.state = State::Draining(Instant::now());
@@ -189,6 +236,8 @@ impl Connection {
         self.written = 0;
     }
 
+    /// Reads and throws away what the client still sends.
+    /// `Closed`: the client closed, or it sent more than `MAX_DRAIN`.
     pub fn drain(&mut self) -> ReadOutcome {
         let mut tmp = [0u8; READ_CHUNK];
         loop {
@@ -221,7 +270,7 @@ impl Connection {
     }
 }
 
-/// The three timeout rules, as a pure function (no socket, easy to test).
+/// The timeout rules, as a pure function (no socket, easy to test).
 pub fn check_timeout(
     state: State,
     partial_request: bool,

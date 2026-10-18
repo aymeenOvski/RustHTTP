@@ -1,19 +1,25 @@
-//! Owner: Person A — raw bytes -> request head.
-//! The body is handled in 2c, once we know the server's body limit.
+//! raw bytes → request.
+//!
+//! - `parse_head`: request line and headers.
+//! - `body_kind`: how the body is framed (none, Content-Length or chunked).
+//! - `ChunkedDecoder`: decodes a chunked body while its bytes arrive.
+//!
+//! Nothing here touches a socket: every function works on a byte slice.
 use std::collections::HashMap;
 
 use super::{Method, Request};
 
-/// A head bigger than this is refused (protects memory).
+/// Largest accepted head (request line + headers). Protects memory.
 pub const MAX_HEAD_SIZE: usize = 16 * 1024;
 
+/// Why a request is refused. `status()` gives the HTTP code to answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParseError {
-    /// Broken request → 400
+    /// Malformed request → 400.
     BadRequest,
-    /// A real method we don't support (PUT, PATCH...) → 405
+    /// A real method we don't support (PUT, PATCH...) → 405.
     MethodNotAllowed,
-    /// Body over the limit → 413 (used in 2c)
+    /// Body over `client_max_body_size` → 413.
     PayloadTooLarge,
 }
 
@@ -27,7 +33,7 @@ impl ParseError {
     }
 }
 
-/// Everything before the body.
+/// The request line and headers: everything before the body.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RequestHead {
     pub method: Method,
@@ -42,6 +48,7 @@ pub struct RequestHead {
 }
 
 impl RequestHead {
+    /// Header value by name, in any letter case.
     pub fn header(&self, name: &str) -> Option<&str> {
         self.headers
             .get(&name.to_ascii_lowercase())
@@ -61,11 +68,20 @@ impl RequestHead {
     }
 }
 
+/// Parses the head at the start of `buf`.
+///
+/// - `Ok(None)`: the head is not complete yet. Read more, then call again.
+/// - `Ok(Some(head))`: complete. The body starts at `head.head_len`.
+/// - `Err(e)`: broken request; answer `e.status()` and close.
+///
+/// Refused with 400: a head over `MAX_HEAD_SIZE`, text that is not UTF-8,
+/// a bad request line or header line, or HTTP/1.1 without `Host`.
 pub fn parse_head(buf: &[u8]) -> Result<Option<RequestHead>, ParseError> {
     // 1. Find the empty line that ends the head.
     let end = match find(buf, b"\r\n\r\n") {
         Some(i) => i,
         None => {
+            // Still no end after MAX_HEAD_SIZE bytes: stop waiting.
             if buf.len() > MAX_HEAD_SIZE {
                 return Err(ParseError::BadRequest);
             }
@@ -88,6 +104,7 @@ pub fn parse_head(buf: &[u8]) -> Result<Option<RequestHead>, ParseError> {
     let mut headers: HashMap<String, String> = HashMap::new();
     for line in lines {
         let (name, value) = line.split_once(':').ok_or(ParseError::BadRequest)?;
+        // No space allowed in a name, not even before ':' (RFC 9112).
         if name.is_empty() || name.contains(|c: char| c.is_whitespace()) {
             return Err(ParseError::BadRequest);
         }
@@ -123,10 +140,14 @@ pub enum BodyKind {
     None,
     /// Exactly this many bytes follow the head.
     Length(usize),
-    /// Transfer-Encoding: chunked (Step 4).
+    /// `Transfer-Encoding: chunked`: the size is known only at the last chunk.
     Chunked,
 }
 
+/// Reads the framing headers.
+///
+/// Refused with 400: both `Content-Length` and `Transfer-Encoding`, an
+/// encoding other than `chunked`, or an invalid length.
 pub fn body_kind(head: &RequestHead) -> Result<BodyKind, ParseError> {
     match (
         head.header("transfer-encoding"),
@@ -186,6 +207,9 @@ enum ChunkState {
 }
 
 /// Decodes a chunked body piece by piece, remembering where it stopped.
+///
+/// Call `advance` every time new bytes arrive. Bytes already decoded are
+/// never read twice.
 #[derive(Debug)]
 pub struct ChunkedDecoder {
     /// Position in `raw` (the bytes after the head) where we stopped.
@@ -193,6 +217,7 @@ pub struct ChunkedDecoder {
     state: ChunkState,
     /// The real body: chunk data only, no sizes, no "\r\n".
     body: Vec<u8>,
+    /// Trailer bytes seen so far, limited by `MAX_TRAILERS`.
     trailer_bytes: usize,
 }
 
@@ -206,6 +231,13 @@ impl ChunkedDecoder {
         }
     }
 
+    /// Decodes as much of `raw` as possible. `raw` = the bytes after the head.
+    ///
+    /// - `Ok(true)`: the body is complete; it used `consumed()` bytes of `raw`.
+    /// - `Ok(false)`: more bytes are needed.
+    /// - `Err`: broken encoding (400) or body over `max_body` (413).
+    ///
+    /// The 413 is decided from the size line, before that chunk's data arrives.
     pub fn advance(&mut self, raw: &[u8], max_body: usize) -> Result<bool, ParseError> {
         loop {
             match self.state {
@@ -213,6 +245,7 @@ impl ChunkedDecoder {
                     let line_end = match find_newline(raw, self.pos) {
                         Some(i) => i,
                         None => {
+                            // No end of line yet: wait, unless it is already too long.
                             if raw.len() - self.pos > MAX_CHUNK_LINE {
                                 return Err(ParseError::BadRequest);
                             }
@@ -247,6 +280,7 @@ impl ChunkedDecoder {
                     }
                     self.state = ChunkState::DataEnd;
                 }
+                // Accepts "\r\n" or a bare "\n".
                 ChunkState::DataEnd => match raw.get(self.pos) {
                     None => return Ok(false),
                     Some(b'\n') => {
@@ -276,8 +310,9 @@ impl ChunkedDecoder {
                     let line = &raw[self.pos..line_end];
                     self.pos = line_end + 1;
                     if line.is_empty() || line == b"\r" {
-                        self.state = ChunkState::Done;
+                        self.state = ChunkState::Done; // empty line = end of body
                     } else {
+                        // A trailer header: counted, then ignored.
                         self.trailer_bytes += line.len() + 1;
                         if self.trailer_bytes > MAX_TRAILERS {
                             return Err(ParseError::BadRequest);
@@ -289,10 +324,15 @@ impl ChunkedDecoder {
         }
     }
 
+    /// Bytes of `raw` used so far (sizes and "\r\n" included).
+    /// Once complete, the next pipelined request starts at this index.
     pub fn consumed(&self) -> usize {
         self.pos
     }
 
+    /// Returns how many bytes were used and restarts the position at 0.
+    /// The caller must remove exactly that many bytes from the front of `raw`,
+    /// so decoded bytes do not stay in memory twice.
     pub fn forget_consumed(&mut self) -> usize {
         std::mem::take(&mut self.pos)
     }
@@ -329,6 +369,7 @@ fn find_newline(buf: &[u8], from: usize) -> Option<usize> {
         .map(|i| from + i)
 }
 
+/// (method, path, query, version)
 type RequestLine = (Method, String, Option<String>, String);
 
 /// "GET /index.html?x=1 HTTP/1.1" -> (Get, "/index.html", Some("x=1"), "HTTP/1.1")
