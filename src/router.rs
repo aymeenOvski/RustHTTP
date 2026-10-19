@@ -48,18 +48,19 @@ pub fn handle(req: &Request, server: &ServerConfig) -> Response {
         Some(r) => r,
         None => return error_response(404, server), // No route matches -> 404 Not Found
     };
-
-    // Validate if the HTTP method is allowed for this route
-    if !route.methods.contains(&req.method) {
-        return error_response(405, server); // Method not allowed -> 405 Method Not Allowed
-    }
-
+    
     // Handle Redirections
     if let Some(ref target) = route.redirect {
         return Response::new(301)
             .with_header("Location", target)
             .with_body(b"Moved Permanently".to_vec());
     }
+    
+    // Validate if the HTTP method is allowed for this route
+    if !route.methods.contains(&req.method) {
+        return error_response(405, server); // Method not allowed -> 405 Method Not Allowed
+    }
+
 
     // Dispatch to CGI if the file extension matches a CGI rule
     for (ext, _interpreter) in &route.cgi {
