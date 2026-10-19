@@ -129,9 +129,9 @@ fn parse_and_save_multipart(body: &[u8], boundary: &str, upload_path: &Path) -> 
                 let unique_name = make_unique_filename(&safe_name);
 
                 // Verify actual file bytes via magic numbers
-                if !validate_file_magic_bytes(content) {
-                    return Err(400); // Bad Request: File signature mismatch
-                }
+                // if !validate_file_magic_bytes(content) {
+                //     return Err(400); // Bad Request: File signature mismatch
+                // }
 
                 // Write to disk
                 let target_file_path = upload_path.join(unique_name);

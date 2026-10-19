@@ -2,13 +2,13 @@
 use crate::config::{RouteConfig, ServerConfig};
 use crate::error::error_response;
 use crate::http::{Request, Response};
-
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 pub fn serve(req: &Request, route: &RouteConfig, server: &ServerConfig) -> Response {
     let route_path_str = route.path.as_str();
-    
+
     let route_root_str = match route.root.as_ref().and_then(|p| p.to_str()) {
         Some(s) => s,
         None => "",
@@ -17,8 +17,8 @@ pub fn serve(req: &Request, route: &RouteConfig, server: &ServerConfig) -> Respo
     //  Handle DELETE method
     if req.method.to_string() == "DELETE" {
         let target_path = match resolve_safe_path(&req.path, route_path_str, route_root_str) {
-            Some(path) => path,
-            None => return error_response(403, server),
+            Ok(path) => path,
+            Err(code) => return error_response(code, server),
         };
 
         match handle_delete(&target_path) {
@@ -40,8 +40,8 @@ pub fn serve(req: &Request, route: &RouteConfig, server: &ServerConfig) -> Respo
 
     // Resolve and secure the path
     let target_path = match resolve_safe_path(&req.path, route_path_str, route_root_str) {
-        Some(path) => path,
-        None => return error_response(403, server), // Forbidden / Path traversal
+        Ok(path) => path,
+        Err(code) => return error_response(code, server),
     };
 
     if !target_path.exists() {
@@ -50,7 +50,12 @@ pub fn serve(req: &Request, route: &RouteConfig, server: &ServerConfig) -> Respo
 
     // Handle Directory vs File
     let result = if target_path.is_dir() {
-        handle_directory(&target_path, &req.path, route.autoindex)
+        handle_directory(
+            &target_path,
+            &req.path,
+            route.index.as_deref(),
+            route.autoindex,
+        )
     } else {
         serve_file(&target_path)
     };
@@ -67,30 +72,32 @@ pub fn serve(req: &Request, route: &RouteConfig, server: &ServerConfig) -> Respo
 }
 
 // Safely resolves a URI path against a route root directory.
-// Prevents directory traversal attacks.
-pub fn resolve_safe_path(uri_path: &str, route_path: &str, root_dir: &str) -> Option<PathBuf> {
+// Err(404): the file does not exist. Err(403): trying to leave the root.
+// Err(500): the route's root folder itself is missing (config problem).
+pub fn resolve_safe_path(uri_path: &str, route_path: &str, root_dir: &str) -> Result<PathBuf, u16> {
     let root_path = Path::new(root_dir);
 
     // Strip the route prefix from the requested URI
-    let stripped = if uri_path.starts_with(route_path) {
-        &uri_path[route_path.len()..]
-    } else {
-        uri_path
+    let stripped = uri_path.strip_prefix(route_path).unwrap_or(uri_path);
+    let clean_uri = stripped.trim_start_matches('/');
+
+    // ".." means trying to climb out of the root: refuse before touching the disk.
+    if clean_uri.split(['/', '\\']).any(|part| part == "..") {
+        return Err(403);
+    }
+
+    let canonical_root = root_path.canonicalize().map_err(|_| 500u16)?;
+    let canonical_target = match root_path.join(clean_uri).canonicalize() {
+        Ok(path) => path,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(404),
+        Err(_) => return Err(403), // e.g. permission denied
     };
 
-    // Clean leading slashes and join with the root directory
-    let clean_uri = stripped.trim_start_matches('/');
-    let full_path = root_path.join(clean_uri);
-
-    // Security check: Ensure the canonicalized path stays within the root
-    let canonical_root = root_path.canonicalize().ok()?;
-
-    let canonical_target = full_path.canonicalize().ok()?;
-
-    if canonical_target.starts_with(canonical_root) {
-        Some(canonical_target)
+    // A symbolic link could still point outside the root.
+    if canonical_target.starts_with(&canonical_root) {
+        Ok(canonical_target)
     } else {
-        None // Traversal attempt detected!
+        Err(403)
     }
 }
 
@@ -134,10 +141,11 @@ pub fn serve_file(path: &Path) -> Result<(Vec<(String, String)>, Vec<u8>), u16> 
 pub fn handle_directory(
     dir_path: &Path,
     request_uri: &str,
+    index: Option<&str>, // NEW: the route's `index` from the config
     autoindex: bool,
 ) -> Result<(Vec<(String, String)>, Vec<u8>), u16> {
-    // Check for a default index file
-    let index_path = dir_path.join("index.html");
+    // The route's default file (config `index`), or index.html if not set.
+    let index_path = dir_path.join(index.unwrap_or("index.html"));
     if index_path.is_file() {
         return serve_file(&index_path);
     }

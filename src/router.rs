@@ -94,9 +94,11 @@ pub fn handle(req: &Request, server: &ServerConfig) -> Response {
     // Default Fallback: Hand off to Static Files (Handles GET, file downloads, autoindex, and DELETE)
     let mut resp = static_files::serve(req, route, server);
 
-
     if is_new_session {
-        resp = resp.with_header("Set-Cookie", &format!("session_id={actual_session_id}; Path=/; HttpOnly"));
+        resp = resp.with_header(
+            "Set-Cookie",
+            &format!("session_id={actual_session_id}; Path=/; HttpOnly"),
+        );
     }
 
     resp
@@ -108,12 +110,10 @@ fn find_matching_route<'a>(path: &str, routes: &'a [RouteConfig]) -> Option<&'a 
     let mut longest_len = 0;
 
     for route in routes {
-        // Check if the request path matches the route exactly or starts with it as a subdirectory
-        let is_match = if route.path == "/" {
-            path == "/"
-        } else {
-            path == route.path || path.starts_with(&format!("{}/", route.path))
-        };
+        // The route "/docs" matches "/docs" and "/docs/...", but not "/docsx".
+        // The route "/" (prefix "") matches every path.
+        let prefix = route.path.trim_end_matches('/');
+        let is_match = path == prefix || path.starts_with(&format!("{prefix}/"));
 
         if is_match {
             if route.path.len() > longest_len {
