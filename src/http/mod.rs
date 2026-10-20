@@ -102,6 +102,8 @@ pub fn reason_phrase(status: u16) -> &'static str {
         413 => "Payload Too Large",
         500 => "Internal Server Error",
         501 => "Not Implemented",
+        502 => "Bad Gateway",
+        504 => "Gateway Timeout",
         _ => "Unknown",
     }
 }

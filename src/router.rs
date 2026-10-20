@@ -7,12 +7,30 @@ use crate::utils::session::SessionStore;
 use crate::config::{RouteConfig, ServerConfig};
 use crate::error::error_response;
 use crate::http::{Request, Response};
-use crate::{cgi, static_files, upload};
+use crate::{static_files, upload};
+
+use crate::cgi::CgiJob;
+use std::io;
+
+pub enum Outcome {
+    Response(Response),
+    Cgi {
+        job: CgiJob,
+        set_cookie: Option<String>,
+    },
+}
 
 static SESSION_STORE: LazyLock<Mutex<SessionStore>> =
     LazyLock::new(|| Mutex::new(SessionStore::new()));
 
 pub fn handle(req: &Request, server: &ServerConfig) -> Response {
+    match dispatch(req, server) {
+        Outcome::Response(r) => r,
+        Outcome::Cgi { .. } => Response::text(501, "CGI needs the event loop\n"),
+    }
+}
+
+pub fn dispatch(req: &Request, server: &ServerConfig) -> Outcome {
     // Parse incoming cookies and check for an active session ID
     let mut store = SESSION_STORE.lock().unwrap();
     let mut session_id = None;
@@ -46,19 +64,21 @@ pub fn handle(req: &Request, server: &ServerConfig) -> Response {
 
     let route = match matched_route {
         Some(r) => r,
-        None => return error_response(404, server), // No route matches -> 404 Not Found
+        None => return Outcome::Response(error_response(404, server)), // No route matches -> 404 Not Found
     };
 
     // Handle Redirections
     if let Some(ref target) = route.redirect {
-        return Response::new(301)
-            .with_header("Location", target)
-            .with_body(b"Moved Permanently".to_vec());
+        return Outcome::Response(
+            Response::new(301)
+                .with_header("Location", target)
+                .with_body(b"Moved Permanently".to_vec()),
+        );
     }
 
     // Validate if the HTTP method is allowed for this route
     if !route.methods.contains(&req.method) {
-        return error_response(405, server); // Method not allowed -> 405 Method Not Allowed
+        return Outcome::Response(error_response(405, server)); // Method not allowed -> 405 Method Not Allowed
     }
 
     // Dispatch to CGI if the file extension matches a CGI rule
@@ -67,14 +87,21 @@ pub fn handle(req: &Request, server: &ServerConfig) -> Response {
             if let Some(ref root) = route.root {
                 let relative_path = req.path.strip_prefix(&route.path).unwrap_or(&req.path);
                 let script_path = root.join(relative_path.trim_start_matches('/'));
-                let mut resp = cgi::run(req, route, &script_path);
-                if is_new_session {
-                    resp = resp.with_header(
-                        "Set-Cookie",
-                        &format!("session_id={actual_session_id}; Path=/; HttpOnly"),
-                    );
-                }
-                return resp;
+                return match CgiJob::start(req, route, &script_path) {
+                    Ok(job) => Outcome::Cgi {
+                        job,
+                        set_cookie: is_new_session
+                            .then(|| format!("session_id={actual_session_id}; Path=/; HttpOnly")),
+                    },
+                    Err(e) => {
+                        let status = match e.kind() {
+                            io::ErrorKind::NotFound => 404,
+                            io::ErrorKind::PermissionDenied => 403,
+                            _ => 500,
+                        };
+                        Outcome::Response(error_response(status, server))
+                    }
+                };
             }
         }
     }
@@ -88,7 +115,7 @@ pub fn handle(req: &Request, server: &ServerConfig) -> Response {
                 &format!("session_id={actual_session_id}; Path=/; HttpOnly"),
             );
         }
-        return resp;
+        return Outcome::Response(resp);
     }
 
     // Default Fallback: Hand off to Static Files (Handles GET, file downloads, autoindex, and DELETE)
@@ -101,7 +128,7 @@ pub fn handle(req: &Request, server: &ServerConfig) -> Response {
         );
     }
 
-    resp
+    Outcome::Response(resp)
 }
 
 // Helper function to find the longest matching route prefix

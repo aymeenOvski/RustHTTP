@@ -7,6 +7,8 @@ use std::io::{self, IoSlice, Read, Write};
 use std::net::Shutdown;
 use std::time::{Duration, Instant};
 
+use crate::cgi::CgiJob;
+use mio::Token;
 use mio::net::TcpStream;
 
 use crate::http::parser::{ChunkedDecoder, RequestHead};
@@ -26,6 +28,8 @@ pub enum State {
     Reading,
     /// Sending a response.
     Writing,
+    // A CGI script is running for this request.
+    WaitingCgi,
     /// Last response sent and our side shut down (FIN). Reads and throws away
     /// what the client still sends until it closes, so closing does not send
     /// a reset (RST) that could make the client lose the response.
@@ -80,6 +84,20 @@ pub struct Pending {
     pub server: usize,
 }
 
+// A running CGI script plus what is needed to answer once it ends.
+pub struct CgiRun {
+    pub job: CgiJob,
+    pub server: usize,
+    // Close the connection after the response?
+    pub close: bool,
+    // Session cookie to add to the response, if the session is new.
+    pub set_cookie: Option<String>,
+    pub out_token: Option<Token>,
+    pub in_token: Option<Token>,
+    // Pipes registered in the Poll yet?
+    pub registered: bool,
+}
+
 pub struct Connection {
     pub stream: TcpStream,
     /// Index of the listener that accepted this client.
@@ -107,6 +125,8 @@ pub struct Connection {
     /// The part of "100 Continue" the socket did not accept (almost always
     /// empty). Sent just before the final response.
     pub interim: Vec<u8>,
+    // A CGI script is running for this request.
+    pub cgi: Option<CgiRun>,
 }
 
 impl Connection {
@@ -125,7 +145,15 @@ impl Connection {
             request_started: None,
             drained: 0,
             interim: Vec::new(),
+            cgi: None,
         }
+    }
+
+    // A CGI script was started for the pending request.
+    pub fn start_cgi(&mut self, run: CgiRun) {
+        self.cgi = Some(run);
+        self.state = State::WaitingCgi;
+        self.last_activity = Instant::now();
     }
 
     /// Reads ONE chunk from the socket into `read_buf`.
@@ -295,6 +323,7 @@ pub fn check_timeout(
         State::Draining(since) => {
             (now.duration_since(since) > LINGER).then_some(Expired::DrainOver)
         }
+        State::WaitingCgi => None,
     }
 }
 
@@ -384,6 +413,15 @@ mod tests {
                 t0 + secs(111),
                 T
             ),
+            None
+        );
+    }
+    
+    #[test]
+    fn waiting_cgi_never_hits_the_idle_rules() {
+        let t0 = Instant::now();
+        assert_eq!(
+            check_timeout(State::WaitingCgi, false, t0, None, t0 + secs(3600), T),
             None
         );
     }

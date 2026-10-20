@@ -13,14 +13,17 @@ use mio::net::TcpListener;
 use mio::{Events, Interest, Poll, Token};
 
 use crate::config::{Config, ServerConfig};
-use crate::connection::{
-    Connection, Expired, Pending, PendingBody, ReadOutcome, State, WriteOutcome,
-};
+
 use crate::error::error_response;
 use crate::http::parser::{BodyKind, ChunkedDecoder, RequestHead, body_kind, parse_head};
 use crate::http::serialize::{Wire, to_wire};
 use crate::http::{Request, Response};
-use crate::router;
+
+use crate::cgi::{CgiJob, CgiRead};
+use crate::connection::{
+    CgiRun, Connection, Expired, Pending, PendingBody, ReadOutcome, State, WriteOutcome,
+};
+use crate::router::{self, Outcome};
 
 /// Max time a client may stay idle, take to send one request (then 408), or
 /// go without write progress.
@@ -28,6 +31,18 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How often expired connections are looked for.
 const SWEEP_EVERY: Duration = Duration::from_secs(1);
+
+// Max time a CGI script may run before the client gets a 504.
+const CGI_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Clone, Copy)]
+enum Pipe {
+    Out, // the script's stdout
+    In,  // the script's stdin
+}
+
+// pipe token -> (token of the client that owns it, which pipe)
+type CgiPipes = HashMap<Token, (Token, Pipe)>;
 
 /// Binds every address in the config and runs the event loop forever.
 ///
@@ -96,6 +111,7 @@ pub fn run(config: Config) -> io::Result<()> {
     }
 
     let mut connections: HashMap<Token, Connection> = HashMap::new();
+    let mut cgi_pipes: CgiPipes = HashMap::new();
     let mut next_token = listeners.len();
     let mut last_sweep = Instant::now();
     // accept_blocked[i]: accept() failed on listener i (e.g. too many open
@@ -137,17 +153,43 @@ pub fn run(config: Config) -> io::Result<()> {
                     &mut next_token,
                     &mut accept_blocked,
                 );
+            } else if let Some(&(owner, pipe)) = cgi_pipes.get(&token) {
+                // ── a CGI pipe rang ─────────────────────────────────
+                let finished = match connections.get_mut(&owner) {
+                    Some(conn) => cgi_event(conn, pipe, &config.servers),
+                    None => None,
+                };
+                if let Some(response) = finished {
+                    finish_cgi(
+                        owner,
+                        response,
+                        &mut connections,
+                        &mut cgi_pipes,
+                        &poll,
+                        &config.servers,
+                        &listener_servers,
+                        &mut next_token,
+                    );
+                }
             } else {
                 // ── a client rang: let its state machine move ───────
                 let keep_open = match connections.get_mut(&token) {
                     Some(conn) => {
                         let group = &listener_servers[conn.listener];
-                        drive_safely(token, conn, &config.servers, group)
+                        advance(
+                            token,
+                            conn,
+                            &config.servers,
+                            group,
+                            &poll,
+                            &mut cgi_pipes,
+                            &mut next_token,
+                        )
                     }
                     None => continue,
                 };
                 if !keep_open {
-                    close_connection(token, &mut connections, &poll);
+                    close_connection(token, &mut connections, &poll, &mut cgi_pipes);
                 }
             }
         }
@@ -155,7 +197,14 @@ pub fn run(config: Config) -> io::Result<()> {
         // ── about once a second: enforce the timeouts ───────────────
         if last_sweep.elapsed() >= SWEEP_EVERY {
             last_sweep = Instant::now();
-            sweep_timeouts(&mut connections, &listener_servers, &config.servers, &poll);
+            sweep_timeouts(
+                &mut connections,
+                &mut cgi_pipes,
+                &listener_servers,
+                &config.servers,
+                &poll,
+                &mut next_token,
+            );
         }
     }
 }
@@ -239,8 +288,16 @@ fn drive_safely(
 }
 
 /// Stops watching the client and drops it, which closes its socket.
-fn close_connection(token: Token, connections: &mut HashMap<Token, Connection>, poll: &Poll) {
+fn close_connection(
+    token: Token,
+    connections: &mut HashMap<Token, Connection>,
+    poll: &Poll,
+    cgi_pipes: &mut CgiPipes,
+) {
     if let Some(mut gone) = connections.remove(&token) {
+        if let Some(mut run) = gone.cgi.take() {
+            release_cgi(&mut run, poll, cgi_pipes); // run dropped: kill + wait
+        }
         let _ = poll.registry().deregister(&mut gone.stream);
         println!("client {token:?} closed");
     }
@@ -250,19 +307,44 @@ fn close_connection(token: Token, connections: &mut HashMap<Token, Connection>, 
 /// A stuck request first gets a 408 response.
 fn sweep_timeouts(
     connections: &mut HashMap<Token, Connection>,
+    cgi_pipes: &mut CgiPipes,
     listener_servers: &[Vec<usize>],
     servers: &[ServerConfig],
     poll: &Poll,
+    next_token: &mut usize,
 ) {
     let now = Instant::now();
 
-    // 1. Collect first: we can't remove from the map while iterating it.
+    // Scripts that ran too long -> 504.
+    let slow: Vec<(Token, usize)> = connections
+        .iter()
+        .filter_map(|(t, c)| {
+            c.cgi
+                .as_ref()
+                .filter(|r| r.job.started.elapsed() > CGI_TIMEOUT)
+                .map(|r| (*t, r.server))
+        })
+        .collect();
+    for (token, server) in slow {
+        println!("{token:?}: CGI timed out -> 504");
+        finish_cgi(
+            token,
+            error_response(504, &servers[server]),
+            connections,
+            cgi_pipes,
+            poll,
+            servers,
+            listener_servers,
+            next_token,
+        );
+    }
+
+    // Ordinary connection timeouts.
     let expired: Vec<(Token, Expired)> = connections
         .iter()
         .filter_map(|(token, conn)| conn.expired(now, TIMEOUT).map(|why| (*token, why)))
         .collect();
 
-    // 2. Then act on each one.
     for (token, why) in expired {
         println!("{token:?} timed out ({why:?})");
 
@@ -277,14 +359,14 @@ fn sweep_timeouts(
                     };
                     conn.pending = None;
                     conn.queue(error_wire(408, &servers[index]), true);
-                    drive_safely(token, conn, servers, group)
+                    advance(token, conn, servers, group, poll, cgi_pipes, next_token)
                 }
                 None => false,
             },
         };
 
         if !keep_open {
-            close_connection(token, connections, poll);
+            close_connection(token, connections, poll, cgi_pipes);
         }
     }
 }
@@ -344,16 +426,34 @@ fn drive(token: Token, conn: &mut Connection, servers: &[ServerConfig], group: &
                     Ok(Some((request, index))) => {
                         let server = &servers[index];
                         let close = !wants_keep_alive(&request);
-                        let response = run_router(&request, server);
-                        println!(
-                            "{token:?}: {} {} [server #{index}] body {} bytes -> {} ({})",
-                            request.method,
-                            request.path,
-                            request.body.len(),
-                            response.status,
-                            if close { "close" } else { "keep-alive" }
-                        );
-                        conn.queue(finalize(response, close), close);
+                        match run_router(&request, server) {
+                            Outcome::Response(response) => {
+                                println!(
+                                    "{token:?}: {} {} [server #{index}] body {} bytes -> {} ({})",
+                                    request.method,
+                                    request.path,
+                                    request.body.len(),
+                                    response.status,
+                                    if close { "close" } else { "keep-alive" }
+                                );
+                                conn.queue(finalize(response, close), close);
+                            }
+                            Outcome::Cgi { job, set_cookie } => {
+                                println!(
+                                    "{token:?}: {} {} [server #{index}] -> CGI started",
+                                    request.method, request.path
+                                );
+                                conn.start_cgi(CgiRun {
+                                    job,
+                                    server: index,
+                                    close,
+                                    set_cookie,
+                                    out_token: None,
+                                    in_token: None,
+                                    registered: false,
+                                });
+                            }
+                        }
                         continue;
                     }
                     Ok(None) => {} // body still arriving
@@ -387,7 +487,143 @@ fn drive(token: Token, conn: &mut Connection, servers: &[ServerConfig], group: &
                 ReadOutcome::WouldBlock => return true, // wait for the client to close
                 _ => return false,                      // it closed (or misbehaves): close now
             },
+            State::WaitingCgi => return true,
         }
+    }
+}
+
+// `drive_safely`, then register the pipes of a CGI job it may have started.
+// Returns false when the connection must be closed.
+fn advance(
+    token: Token,
+    conn: &mut Connection,
+    servers: &[ServerConfig],
+    group: &[usize],
+    poll: &Poll,
+    cgi_pipes: &mut CgiPipes,
+    next_token: &mut usize,
+) -> bool {
+    loop {
+        if !drive_safely(token, conn, servers, group) {
+            return false;
+        }
+        if !matches!(&conn.cgi, Some(run) if !run.registered) {
+            return true;
+        }
+        match register_cgi(token, conn, poll, cgi_pipes, next_token) {
+            Ok(()) => return true,
+            Err(e) => {
+                eprintln!("{token:?}: cannot watch CGI pipes: {e}");
+                if let Some(mut run) = conn.cgi.take() {
+                    release_cgi(&mut run, poll, cgi_pipes);
+                    conn.queue(error_wire(500, &servers[run.server]), true);
+                }
+                // loop: drive sends the 500
+            }
+        }
+    }
+}
+
+// Gives the job's pipes their own tokens and watches them.
+fn register_cgi(
+    owner: Token,
+    conn: &mut Connection,
+    poll: &Poll,
+    cgi_pipes: &mut CgiPipes,
+    next_token: &mut usize,
+) -> io::Result<()> {
+    let run = conn
+        .cgi
+        .as_mut()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no CGI job"))?;
+
+    if let Some(out) = run.job.stdout.as_mut() {
+        let t = Token(*next_token);
+        *next_token += 1;
+        poll.registry().register(out, t, Interest::READABLE)?;
+        cgi_pipes.insert(t, (owner, Pipe::Out));
+        run.out_token = Some(t);
+    }
+    if let Some(inp) = run.job.stdin.as_mut() {
+        let t = Token(*next_token);
+        *next_token += 1;
+        poll.registry().register(inp, t, Interest::WRITABLE)?;
+        cgi_pipes.insert(t, (owner, Pipe::In));
+        run.in_token = Some(t);
+    }
+    run.registered = true;
+    Ok(())
+}
+
+// Stops watching the job's pipes and forgets their tokens.
+// When the `CgiRun` is dropped afterwards, the script is killed and reaped.
+fn release_cgi(run: &mut CgiRun, poll: &Poll, cgi_pipes: &mut CgiPipes) {
+    if let Some(t) = run.out_token.take() {
+        if let Some(out) = run.job.stdout.as_mut() {
+            let _ = poll.registry().deregister(out);
+        }
+        cgi_pipes.remove(&t);
+    }
+    if let Some(t) = run.in_token.take() {
+        if let Some(inp) = run.job.stdin.as_mut() {
+            let _ = poll.registry().deregister(inp);
+        }
+        cgi_pipes.remove(&t);
+    }
+}
+
+// A pipe event: send more body, or read output.
+// Returns the response once the script is done (or failed).
+fn cgi_event(conn: &mut Connection, pipe: Pipe, servers: &[ServerConfig]) -> Option<Response> {
+    let run = conn.cgi.as_mut()?;
+    let server = &servers[run.server];
+    match pipe {
+        Pipe::In => {
+            run.job.write_body();
+            None
+        }
+        Pipe::Out => match run.job.read_output() {
+            CgiRead::WouldBlock => None,
+            CgiRead::Eof => Some(CgiJob::parse_output(&std::mem::take(&mut run.job.output))),
+            CgiRead::TooLarge => Some(error_response(502, server)),
+            CgiRead::Failed => Some(error_response(500, server)),
+        },
+    }
+}
+
+// The script is over: free its pipes and process, queue the response,
+// and let the connection send it.
+fn finish_cgi(
+    token: Token,
+    response: Response,
+    connections: &mut HashMap<Token, Connection>,
+    cgi_pipes: &mut CgiPipes,
+    poll: &Poll,
+    servers: &[ServerConfig],
+    listener_servers: &[Vec<usize>],
+    next_token: &mut usize,
+) {
+    let keep_open = match connections.get_mut(&token) {
+        Some(conn) => {
+            let Some(mut run) = conn.cgi.take() else {
+                return;
+            };
+            release_cgi(&mut run, poll, cgi_pipes);
+
+            let mut response = response;
+            if let Some(cookie) = &run.set_cookie {
+                response = response.with_header("Set-Cookie", cookie);
+            }
+            conn.queue(finalize(response, run.close), run.close);
+            // `run` is dropped at the end of this block: kill + wait, no zombie.
+
+            let group = &listener_servers[conn.listener];
+            advance(token, conn, servers, group, poll, cgi_pipes, next_token)
+        }
+        None => return,
+    };
+    if !keep_open {
+        close_connection(token, connections, poll, cgi_pipes);
     }
 }
 
@@ -449,12 +685,12 @@ fn strip_port(host: &str) -> &str {
 // ───────────────────────────── helpers ──────────────────────────────────
 
 /// Calls the router. A panic inside it becomes a 500 response.
-fn run_router(request: &Request, server: &ServerConfig) -> Response {
-    match panic::catch_unwind(AssertUnwindSafe(|| router::handle(request, server))) {
-        Ok(response) => response,
+fn run_router(request: &Request, server: &ServerConfig) -> Outcome {
+    match panic::catch_unwind(AssertUnwindSafe(|| router::dispatch(request, server))) {
+        Ok(outcome) => outcome,
         Err(_) => {
             eprintln!("router panicked on {} {}", request.method, request.path);
-            error_response(500, server)
+            Outcome::Response(error_response(500, server))
         }
     }
 }
