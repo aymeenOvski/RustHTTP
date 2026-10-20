@@ -48,19 +48,18 @@ pub fn handle(req: &Request, server: &ServerConfig) -> Response {
         Some(r) => r,
         None => return error_response(404, server), // No route matches -> 404 Not Found
     };
-    
+
     // Handle Redirections
     if let Some(ref target) = route.redirect {
         return Response::new(301)
             .with_header("Location", target)
             .with_body(b"Moved Permanently".to_vec());
     }
-    
+
     // Validate if the HTTP method is allowed for this route
     if !route.methods.contains(&req.method) {
         return error_response(405, server); // Method not allowed -> 405 Method Not Allowed
     }
-
 
     // Dispatch to CGI if the file extension matches a CGI rule
     for (ext, _interpreter) in &route.cgi {
@@ -125,4 +124,156 @@ fn find_matching_route<'a>(path: &str, routes: &'a [RouteConfig]) -> Option<&'a 
     }
 
     best_match
+}
+
+// ───────────────────────── route matching tests ─────────────────────────
+
+#[cfg(test)]
+mod route_matching_tests {
+    use super::*;
+    use crate::http::Method;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    fn route(path: &str, root: Option<&str>) -> RouteConfig {
+        RouteConfig {
+            path: path.to_string(),
+            methods: vec![Method::Get],
+            root: root.map(PathBuf::from),
+            ..Default::default()
+        }
+    }
+
+    /// The routes of test/test.conf (server "main").
+    fn routes() -> Vec<RouteConfig> {
+        let mut old = route("/old", None);
+        old.redirect = Some("/".to_string());
+        let mut cgi = route("/cgi-bin", Some("test/www/cgi-bin"));
+        cgi.cgi
+            .insert(".py".to_string(), PathBuf::from("/usr/bin/python3"));
+        vec![
+            route("/", Some("test/www")),
+            route("/docs", Some("test/www/docs")),
+            route("/upload", Some("test/www/uploads")),
+            old,
+            cgi,
+        ]
+    }
+
+    /// The path of the route chosen for `request_path`.
+    fn matched(request_path: &str, routes: &[RouteConfig]) -> Option<String> {
+        find_matching_route(request_path, routes).map(|r| r.path.clone())
+    }
+
+    fn request(method: Method, path: &str) -> Request {
+        Request {
+            method,
+            path: path.to_string(),
+            query: None,
+            version: "HTTP/1.1".to_string(),
+            headers: HashMap::new(),
+            body: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn files_in_the_site_root_use_the_root_route() {
+        let routes = routes();
+        for path in ["/", "/about.html", "/css/style.css"] {
+            assert_eq!(matched(path, &routes).as_deref(), Some("/"), "{path}");
+        }
+    }
+
+    #[test]
+    fn a_route_matches_itself_and_everything_under_it() {
+        let routes = routes();
+        for path in ["/docs", "/docs/", "/docs/one.txt", "/docs/sub/two.txt"] {
+            assert_eq!(matched(path, &routes).as_deref(), Some("/docs"), "{path}");
+        }
+    }
+
+    #[test]
+    fn a_similar_name_is_not_under_the_route() {
+        let routes = routes();
+        assert_eq!(matched("/docsx", &routes).as_deref(), Some("/"));
+        assert_eq!(matched("/documents/a.txt", &routes).as_deref(), Some("/"));
+    }
+
+    #[test]
+    fn the_longest_matching_route_wins() {
+        let mut routes = routes();
+        routes.push(route("/docs/private", Some("test/www/private")));
+        assert_eq!(
+            matched("/docs/private/a.txt", &routes).as_deref(),
+            Some("/docs/private")
+        );
+        assert_eq!(matched("/docs/a.txt", &routes).as_deref(), Some("/docs"));
+    }
+
+    #[test]
+    fn a_trailing_slash_in_the_config_changes_nothing() {
+        let routes = vec![route("/docs/", Some("test/www/docs"))];
+        assert_eq!(matched("/docs", &routes).as_deref(), Some("/docs/"));
+        assert_eq!(matched("/docs/one.txt", &routes).as_deref(), Some("/docs/"));
+    }
+
+    #[test]
+    fn without_a_root_route_unknown_paths_match_nothing() {
+        let routes = vec![route("/docs", Some("test/www/docs"))];
+        assert_eq!(matched("/nothing", &routes), None);
+    }
+
+    #[test]
+    fn requests_reach_the_right_directory_root() {
+        let routes = routes();
+        let found = find_matching_route("/docs/one.txt", &routes).unwrap();
+        assert_eq!(found.root, Some(PathBuf::from("test/www/docs")));
+    }
+
+    #[test]
+    fn redirections_and_cgi_routes_are_found() {
+        let routes = routes();
+        let old = find_matching_route("/old", &routes).unwrap();
+        assert_eq!(old.redirect.as_deref(), Some("/"));
+        let cgi = find_matching_route("/cgi-bin/hello.py", &routes).unwrap();
+        assert!(cgi.cgi.contains_key(".py"));
+    }
+
+    // The router's status codes, for cases that never touch the disk.
+
+    #[test]
+    fn redirect_gives_301_with_location() {
+        let server = ServerConfig {
+            routes: routes(),
+            ..Default::default()
+        };
+        let response = handle(&request(Method::Get, "/old"), &server);
+        assert_eq!(response.status, 301);
+        assert!(
+            response
+                .headers
+                .iter()
+                .any(|(n, v)| n == "Location" && v == "/")
+        );
+    }
+
+    #[test]
+    fn method_not_allowed_gives_405() {
+        let server = ServerConfig {
+            routes: routes(),
+            ..Default::default()
+        };
+        let response = handle(&request(Method::Delete, "/old"), &server);
+        assert_eq!(response.status, 405);
+    }
+
+    #[test]
+    fn no_matching_route_gives_404() {
+        let server = ServerConfig {
+            routes: vec![route("/docs", Some("test/www/docs"))],
+            ..Default::default()
+        };
+        let response = handle(&request(Method::Get, "/nothing"), &server);
+        assert_eq!(response.status, 404);
+    }
 }
