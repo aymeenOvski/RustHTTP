@@ -5,7 +5,7 @@
 //! until its socket says `WouldBlock`, so no client can block the others.
 use std::collections::HashMap;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::panic::{self, AssertUnwindSafe};
 use std::time::{Duration, Instant};
 
@@ -30,8 +30,10 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 const SWEEP_EVERY: Duration = Duration::from_secs(1);
 
 /// Binds every address in the config and runs the event loop forever.
-/// Returns only on a startup error (bad address, bind failed, no server) or
-/// if `poll` itself fails.
+///
+/// An address that cannot be used (unknown host, port already taken) is
+/// skipped with a message: the other servers still start. Returns an error
+/// only if no address at all could be used, or if `poll` itself fails.
 pub fn run(config: Config) -> io::Result<()> {
     let mut poll = Poll::new()?;
     let mut events = Events::with_capacity(1024);
@@ -41,9 +43,13 @@ pub fn run(config: Config) -> io::Result<()> {
     let mut groups: Vec<(SocketAddr, Vec<usize>)> = Vec::new();
     for (i, server) in config.servers.iter().enumerate() {
         for &port in &server.ports {
-            let addr: SocketAddr = format!("{}:{}", server.host, port)
-                .parse()
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+            let addr = match resolve(&server.host, port) {
+                Ok(addr) => addr,
+                Err(e) => {
+                    eprintln!("server #{i}: skipping {}:{port}: {e}", server.host);
+                    continue;
+                }
+            };
 
             match groups.iter_mut().find(|(a, _)| *a == addr) {
                 Some((_, list)) => {
@@ -61,10 +67,21 @@ pub fn run(config: Config) -> io::Result<()> {
     let mut listener_servers: Vec<Vec<usize>> = Vec::new();
 
     for (addr, group) in groups {
-        let mut listener = TcpListener::bind(addr)?;
+        let mut listener = match TcpListener::bind(addr) {
+            Ok(listener) => listener,
+            Err(e) => {
+                eprintln!("cannot listen on {addr}: {e} (servers {group:?} skipped)");
+                continue;
+            }
+        };
         let token = Token(listeners.len());
-        poll.registry()
-            .register(&mut listener, token, Interest::READABLE)?;
+        if let Err(e) = poll
+            .registry()
+            .register(&mut listener, token, Interest::READABLE)
+        {
+            eprintln!("cannot watch {addr}: {e} (servers {group:?} skipped)");
+            continue;
+        }
 
         println!("listening on http://{addr} ({token:?}) servers {group:?}");
         listeners.push(listener);
@@ -73,8 +90,8 @@ pub fn run(config: Config) -> io::Result<()> {
 
     if listeners.is_empty() {
         return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "no server in config",
+            io::ErrorKind::AddrNotAvailable,
+            "no server could start (see the errors above)",
         ));
     }
 
@@ -372,6 +389,19 @@ fn drive(token: Token, conn: &mut Connection, servers: &[ServerConfig], group: &
             },
         }
     }
+}
+
+/// The address to listen on for `host:port`. `host` can be an IP
+/// ("127.0.0.1", "0.0.0.0") or a name ("localhost"), which is looked up.
+/// When a name has several addresses, IPv4 is preferred.
+fn resolve(host: &str, port: u16) -> io::Result<SocketAddr> {
+    let addrs: Vec<SocketAddr> = (host, port).to_socket_addrs()?.collect();
+    addrs
+        .iter()
+        .find(|a| a.is_ipv4())
+        .or(addrs.first())
+        .copied()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no address for this host"))
 }
 
 // ───────────────────────────── virtual hosts ────────────────────────────
@@ -693,6 +723,19 @@ mod tests {
         let (request, _) = take_request(&mut conn, &servers).unwrap().unwrap();
         assert_eq!(request.body, b"hello");
         assert_eq!(conn.read_buf, b"GET /b");
+    }
+
+    #[test]
+    fn resolves_ips_and_names() {
+        let local: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        assert_eq!(resolve("127.0.0.1", 8080).unwrap(), local);
+        assert_eq!(resolve("localhost", 8080).unwrap(), local);
+        assert_eq!(
+            resolve("0.0.0.0", 9000).unwrap(),
+            "0.0.0.0:9000".parse::<SocketAddr>().unwrap()
+        );
+        assert!(resolve("", 8080).is_err());
+        assert!(resolve("bad host!", 8080).is_err());
     }
 
     #[test]
