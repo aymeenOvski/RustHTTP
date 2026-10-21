@@ -94,15 +94,23 @@ pub fn load(path: &str) -> Result<Config, String> {
                         "ports" => {
                             s.ports = val
                                 .split(',')
-                                .map(|p| p.trim().parse::<u16>().unwrap_or(8080))
-                                .collect();
+                                .map(|p| {
+                                    p.trim()
+                                        .parse::<u16>()
+                                        .ok()
+                                        .filter(|&n| n != 0)
+                                        .ok_or_else(|| format!("Invalid port '{}'", p.trim()))
+                                })
+                                .collect::<Result<Vec<u16>, String>>()?;
                         }
                         "server_names" => {
                             s.server_names = val.split(',').map(|n| n.trim().to_string()).collect();
                         }
                         "is_default" => s.is_default = val.parse().unwrap_or(false),
                         "client_max_body_size" => {
-                            s.client_max_body_size = val.parse().unwrap_or(1_000_000)
+                            s.client_max_body_size = val
+                                .parse()
+                                .map_err(|_| format!("Invalid client_max_body_size '{}'", val))?
                         }
                         k if k.starts_with("error_") => {
                             if let Ok(code) = k.trim_start_matches("error_").parse::<u16>() {
@@ -152,15 +160,28 @@ pub fn load(path: &str) -> Result<Config, String> {
 
 // Startup validation to catch duplicate ports and configuration errors.
 pub fn validate(config: &Config) -> Result<(), String> {
-    let mut seen_ports = std::collections::HashSet::new();
+    // Servers may share a port (virtual hosts), but not the same name on it.
+    let mut seen = std::collections::HashSet::new();
 
     for server in &config.servers {
+        // A server without names counts as one unnamed server.
+        let names: Vec<String> = if server.server_names.is_empty() {
+            vec![String::new()]
+        } else {
+            server
+                .server_names
+                .iter()
+                .map(|n| n.to_ascii_lowercase())
+                .collect()
+        };
         for port in &server.ports {
-            if !seen_ports.insert(*port) {
-                return Err(format!(
-                    "Configuration Error: Port {} is configured multiple times across servers!",
-                    port
-                ));
+            for name in &names {
+                if !seen.insert((server.host.clone(), *port, name.clone())) {
+                    return Err(format!(
+                        "Configuration Error: Port {} is configured multiple times for the same server name ({:?})!",
+                        port, name
+                    ));
+                }
             }
         }
     }
@@ -169,27 +190,34 @@ pub fn validate(config: &Config) -> Result<(), String> {
         return Err("Configuration Error: No servers defined in configuration file!".to_string());
     }
 
-    Ok(())
-}
-
-/// Hardcoded config so everyone can work before the parser exists.
-pub fn dev_config() -> Config {
-    Config {
-        servers: vec![ServerConfig {
-            host: "127.0.0.1".into(),
-            ports: vec![8080],
-            is_default: true,
-            client_max_body_size: 1_000_000,
-            routes: vec![RouteConfig {
-                path: "/".into(),
-                methods: vec![Method::Get, Method::Post, Method::Delete],
-                root: Some("./www".into()),
-                index: Some("index.html".into()),
-                ..Default::default()
-            }],
-            ..Default::default()
-        }],
+    for server in &config.servers {
+        if server.client_max_body_size == 0 || server.client_max_body_size > 1 << 30 {
+            return Err(
+                "Configuration Error: client_max_body_size must be between 1 and 1 GiB".to_string(),
+            );
+        }
+        for (code, page) in &server.error_pages {
+            if !page.is_file() {
+                return Err(format!(
+                    "Configuration Error: error page for {} not found: {}",
+                    code,
+                    page.display()
+                ));
+            }
+        }
+        for route in &server.routes {
+            if let Some(root) = &route.root {
+                if !root.is_dir() {
+                    return Err(format!(
+                        "Configuration Error: root folder not found: {}",
+                        root.display()
+                    ));
+                }
+            }
+        }
     }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -224,10 +252,10 @@ mod tests {
             ports = 7070
             is_default = true
             client_max_body_size = 2000000
-            error_404 = www/errors/404.html
+            error_404 = error_pages/404.html
 
             [route.test./]
-            root = www
+            root = src
             methods = GET, POST
             index = index.html
             autoindex = false

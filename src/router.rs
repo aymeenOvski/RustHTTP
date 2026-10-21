@@ -69,6 +69,9 @@ pub fn dispatch(req: &Request, server: &ServerConfig) -> Outcome {
 
     // Handle Redirections
     if let Some(ref target) = route.redirect {
+        if !route.methods.contains(&req.method) {
+            return Outcome::Response(error_response(405, server)); // 405 Method Not Allowed
+        }
         return Outcome::Response(
             Response::new(301)
                 .with_header("Location", target)
@@ -78,7 +81,7 @@ pub fn dispatch(req: &Request, server: &ServerConfig) -> Outcome {
 
     // Validate if the HTTP method is allowed for this route
     if !route.methods.contains(&req.method) {
-        return Outcome::Response(error_response(405, server)); // Method not allowed -> 405 Method Not Allowed
+        return Outcome::Response(error_response(405, server)); // 405 Method Not Allowed
     }
 
     // Dispatch to CGI if the file extension matches a CGI rule
