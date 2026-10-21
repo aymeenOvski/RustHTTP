@@ -21,9 +21,12 @@ use crate::http::{Request, Response};
 
 use crate::cgi::{CgiJob, CgiRead};
 use crate::connection::{
-    CgiRun, Connection, Expired, Pending, PendingBody, ReadOutcome, State, WriteOutcome,
+    CgiRun, Connection, Expired, Pending, PendingBody, READ_CHUNK, ReadOutcome, State,
+    TURN_BUDGET, UploadRun, WriteOutcome,
 };
+use crate::upload::upload_response;
 use crate::router::{self, Outcome};
+use crate::spool::{self, SPOOL_ABOVE, Spool};
 
 /// Max time a client may stay idle, take to send one request (then 408), or
 /// go without write progress.
@@ -51,6 +54,7 @@ type CgiPipes = HashMap<Token, (Token, Pipe)>;
 /// only if no address at all could be used, or if `poll` itself fails.
 pub fn run(config: Config) -> io::Result<()> {
     let mut poll = Poll::new()?;
+    spool::clean_old_files(); // body files left by a server that was killed
     let mut events = Events::with_capacity(1024);
 
     // ── 1. Group servers by address: one listener per host:port ─────
@@ -118,9 +122,20 @@ pub fn run(config: Config) -> io::Result<()> {
     // files). Its waiting clients send no new event, so we retry ourselves.
     let mut accept_blocked: Vec<bool> = vec![false; listeners.len()];
 
+    // Some connection stopped because of TURN_BUDGET and has work left.
+    let mut busy = false;
+
     loop {
         // Wake up at least every 500 ms, so timeouts run even with no events.
-        if let Err(e) = poll.poll(&mut events, Some(Duration::from_millis(500))) {
+        // A busy connection gets no event for the work it has left (its
+        // socket may have nothing new), so then poll only looks for events
+        // and returns at once.
+        let wait = if busy {
+            Duration::ZERO
+        } else {
+            Duration::from_millis(500)
+        };
+        if let Err(e) = poll.poll(&mut events, Some(wait)) {
             if e.kind() == io::ErrorKind::Interrupted {
                 continue;
             }
@@ -194,6 +209,36 @@ pub fn run(config: Config) -> io::Result<()> {
             }
         }
 
+        // ── one more turn for the connections that used up their budget ─
+        // (a big upload being saved, a big download, a fast uploader).
+        // Each gets about TURN_BUDGET bytes, then the loop goes back to poll,
+        // so every client keeps being served.
+        let turn: Vec<Token> = connections
+            .iter()
+            .filter(|(_, conn)| conn.more_work)
+            .map(|(token, _)| *token)
+            .collect();
+        for token in turn {
+            let keep_open = match connections.get_mut(&token) {
+                Some(conn) if conn.more_work => {
+                    let group = &listener_servers[conn.listener];
+                    advance(
+                        token,
+                        conn,
+                        &config.servers,
+                        group,
+                        &poll,
+                        &mut cgi_pipes,
+                        &mut next_token,
+                    )
+                }
+                _ => continue,
+            };
+            if !keep_open {
+                close_connection(token, &mut connections, &poll, &mut cgi_pipes);
+            }
+        }
+
         // ── about once a second: enforce the timeouts ───────────────
         if last_sweep.elapsed() >= SWEEP_EVERY {
             last_sweep = Instant::now();
@@ -206,6 +251,11 @@ pub fn run(config: Config) -> io::Result<()> {
                 &mut next_token,
             );
         }
+
+        // ── free some disk space of deleted temp files (a piece per turn) ─
+        let trash_left = spool::free_some_space();
+
+        busy = trash_left || connections.values().any(|conn| conn.more_work);
     }
 }
 
@@ -371,10 +421,13 @@ fn sweep_timeouts(
     }
 }
 
-/// Moves one connection forward until its socket says `WouldBlock`.
+/// Moves one connection forward until its socket says `WouldBlock`, or
+/// until it used its TURN_BUDGET (then `more_work` is set, and the loop gives
+/// it another turn after the others).
 ///
 /// - Reading: parse the head, pick the server, plan the body, wait for the
 ///   whole request, call the router, queue the response.
+/// - Saving: save the next piece of an upload.
 /// - Writing: send; then close gracefully, or go back to Reading (keep-alive).
 /// - Draining: throw away input until the client closes.
 ///
@@ -382,6 +435,9 @@ fn sweep_timeouts(
 /// already in `read_buf` are answered without waiting for a new event.
 /// Returns false when the connection must be closed.
 fn drive(token: Token, conn: &mut Connection, servers: &[ServerConfig], group: &[usize]) -> bool {
+    conn.more_work = false;
+    // Reads allowed in this turn (TURN_BUDGET bytes).
+    let mut reads_left = TURN_BUDGET / READ_CHUNK;
     loop {
         match conn.state {
             State::Reading => {
@@ -432,7 +488,7 @@ fn drive(token: Token, conn: &mut Connection, servers: &[ServerConfig], group: &
                                     "{token:?}: {} {} [server #{index}] body {} bytes -> {} ({})",
                                     request.method,
                                     request.path,
-                                    request.body.len(),
+                                    request.body_len(),
                                     response.status,
                                     if close { "close" } else { "keep-alive" }
                                 );
@@ -453,6 +509,20 @@ fn drive(token: Token, conn: &mut Connection, servers: &[ServerConfig], group: &
                                     registered: false,
                                 });
                             }
+                            Outcome::Upload { job, set_cookie } => {
+                                println!(
+                                    "{token:?}: {} {} [server #{index}] body {} bytes -> saving",
+                                    request.method,
+                                    request.path,
+                                    request.body_len()
+                                );
+                                conn.start_upload(UploadRun {
+                                    job,
+                                    server: index,
+                                    close,
+                                    set_cookie,
+                                });
+                            }
                         }
                         continue;
                     }
@@ -465,12 +535,36 @@ fn drive(token: Token, conn: &mut Connection, servers: &[ServerConfig], group: &
                     }
                 }
 
-                // 3. Not complete: read one more chunk.
+                // 3. Not complete: read one more chunk (if this turn allows it).
+                if reads_left == 0 {
+                    conn.more_work = true; // bytes may still wait in the kernel
+                    return true;
+                }
+                reads_left -= 1;
                 match conn.fill() {
                     ReadOutcome::Data => {}
                     ReadOutcome::WouldBlock => return true,
                     ReadOutcome::Closed => return false,
                 }
+            }
+            State::Saving => {
+                let Some(run) = conn.upload.as_mut() else {
+                    return false; // cannot happen: Saving always has a job
+                };
+                let Some(result) = run.job.step(TURN_BUDGET) else {
+                    conn.more_work = true; // not finished: next turn
+                    return true;
+                };
+                let Some(run) = conn.upload.take() else {
+                    return false;
+                };
+                let mut response = upload_response(result, &servers[run.server]);
+                println!("{token:?}: upload saved -> {}", response.status);
+                if let Some(cookie) = &run.set_cookie {
+                    response = response.with_header("Set-Cookie", cookie);
+                }
+                conn.queue(finalize(response, run.close), run.close);
+                // `run` is dropped here: the body file is closed.
             }
             State::Writing => match conn.flush() {
                 WriteOutcome::Done => {
@@ -481,6 +575,10 @@ fn drive(token: Token, conn: &mut Connection, servers: &[ServerConfig], group: &
                     }
                 }
                 WriteOutcome::WouldBlock => return true,
+                WriteOutcome::Yield => {
+                    conn.more_work = true; // more to send: next turn
+                    return true;
+                }
                 WriteOutcome::Error => return false,
             },
             State::Draining(_) => match conn.drain() {
@@ -718,9 +816,20 @@ fn body_plan(head: &RequestHead, max_body: usize) -> Result<PendingBody, u16> {
     match body_kind(head) {
         Ok(BodyKind::None) => Ok(PendingBody::Length(0)),
         Ok(BodyKind::Length(n)) if n > max_body => Err(413), // before reading it!
+        // Big body: straight to a file, piece by piece (500 if no file can be made).
+        Ok(BodyKind::Length(n)) if n > SPOOL_ABOVE => match Spool::create() {
+            Ok(spool) => Ok(PendingBody::LengthToFile { missing: n, spool }),
+            Err(e) => {
+                eprintln!("cannot create a body file: {e}");
+                Err(500)
+            }
+        },
         Ok(BodyKind::Length(n)) => Ok(PendingBody::Length(n)),
         // The total size is unknown: the decoder checks the limit chunk by chunk.
-        Ok(BodyKind::Chunked) => Ok(PendingBody::Chunked(ChunkedDecoder::new())),
+        Ok(BodyKind::Chunked) => Ok(PendingBody::Chunked {
+            decoder: ChunkedDecoder::new(),
+            spool: None,
+        }),
         Err(e) => Err(e.status()),
     }
 }
@@ -735,7 +844,7 @@ fn should_send_continue(head: &RequestHead, body: &PendingBody, received: usize)
         .unwrap_or(false);
     let has_body = match body {
         PendingBody::Length(n) => *n > 0,
-        PendingBody::Chunked(_) => true,
+        PendingBody::LengthToFile { .. } | PendingBody::Chunked { .. } => true,
     };
     asked && head.version == "HTTP/1.1" && has_body && received == 0
 }
@@ -745,9 +854,12 @@ fn should_send_continue(head: &RequestHead, body: &PendingBody, received: usize)
 /// - `Ok(Some((request, server)))`: complete. Bytes after it stay in
 ///   `read_buf` (the next pipelined request).
 /// - `Ok(None)`: no head yet, or the body is still arriving.
-/// - `Err((status, server))`: broken chunked body (400) or too big (413).
+/// - `Err((status, server))`: broken chunked body (400), too big (413), or
+///   the body file could not be written (500).
 ///
-/// Decoded chunks leave `read_buf` right away, so they are not kept twice.
+/// Body bytes leave `read_buf` as soon as possible: decoded chunks right
+/// away, and every piece of a big body goes to its file. So `read_buf` stays
+/// small whatever the size of the upload.
 fn take_request(
     conn: &mut Connection,
     servers: &[ServerConfig],
@@ -757,9 +869,15 @@ fn take_request(
         None => return Ok(None),
     };
     let start = pending.head.head_len;
-    let max_body = servers[pending.server].client_max_body_size;
+    let server = pending.server;
+    let max_body = servers[server].client_max_body_size;
+    let disk_error = |e: std::io::Error| {
+        eprintln!("cannot write the body file: {e}");
+        (500, server)
+    };
 
-    // 1. Is the body complete? If yes: how many bytes does this request use?
+    // 1. Is the body complete? If yes: how many bytes of read_buf does this
+    //    request still use?
     let used = match &mut pending.body {
         PendingBody::Length(n) => {
             if conn.read_buf.len() < start + *n {
@@ -767,22 +885,47 @@ fn take_request(
             }
             start + *n
         }
-        PendingBody::Chunked(decoder) => match decoder.advance(&conn.read_buf[start..], max_body) {
-            Ok(true) => start + decoder.consumed(),
-            Ok(false) => {
+        PendingBody::LengthToFile { missing, spool } => {
+            // Move what arrived after the head into the file.
+            let take = (*missing).min(conn.read_buf.len() - start);
+            if take > 0 {
+                spool
+                    .write(&conn.read_buf[start..start + take])
+                    .map_err(disk_error)?;
+                conn.read_buf.drain(start..start + take);
+                *missing -= take;
+            }
+            if *missing > 0 {
+                return Ok(None);
+            }
+            start // only the head is left in read_buf
+        }
+        PendingBody::Chunked { decoder, spool } => {
+            let finished = decoder
+                .advance(&conn.read_buf[start..], max_body)
+                .map_err(|e| (e.status(), server))?;
+            // The decoded body got big: continue it in a file.
+            if spool.is_none() && decoder.decoded_len() > SPOOL_ABOVE {
+                *spool = Some(Spool::create().map_err(disk_error)?);
+            }
+            if let Some(spool) = spool {
+                spool.write(&decoder.take_body()).map_err(disk_error)?;
+            }
+            if finished {
+                start + decoder.consumed()
+            } else {
                 let done = decoder.forget_consumed();
                 conn.read_buf.drain(start..start + done);
                 return Ok(None);
             }
-            Err(e) => return Err((e.status(), pending.server)),
-        },
+        }
     };
 
     // 2. Complete: take the request out.
     let Some(pending) = conn.pending.take() else {
         return Ok(None);
     };
-    let body = match pending.body {
+    let (body, body_file) = match pending.body {
         PendingBody::Length(_) => {
             // MOVE the body instead of copying it:
             // 1. cut off what follows this request (usually nothing),
@@ -791,11 +934,18 @@ fn take_request(
             let mut bytes = std::mem::replace(&mut conn.read_buf, next_request);
             // 3. drop the head: the body slides to the front, same memory.
             bytes.drain(..start);
-            bytes
+            (bytes, None)
         }
-        PendingBody::Chunked(mut decoder) => {
+        PendingBody::LengthToFile { spool, .. } => {
             conn.read_buf.drain(..used); // what follows = the next request
-            decoder.take_body()
+            (Vec::new(), Some(spool.finish().map_err(disk_error)?))
+        }
+        PendingBody::Chunked { mut decoder, spool } => {
+            conn.read_buf.drain(..used); // what follows = the next request
+            match spool {
+                Some(spool) => (Vec::new(), Some(spool.finish().map_err(disk_error)?)),
+                None => (decoder.take_body(), None),
+            }
         }
     };
     // The next request's clock starts now if its bytes are already here.
@@ -804,7 +954,9 @@ fn take_request(
     } else {
         Some(Instant::now())
     };
-    Ok(Some((pending.head.into_request(body), pending.server)))
+    let mut request = pending.head.into_request(body);
+    request.body_file = body_file;
+    Ok(Some((request, server)))
 }
 
 /// `Connection: close` → close; `Connection: keep-alive` → keep.
@@ -844,6 +996,7 @@ mod tests {
             version: version.into(),
             headers,
             body: Vec::new(),
+            body_file: None,
         }
     }
 
@@ -909,12 +1062,16 @@ mod tests {
 
     /// A Connection on a real (local) socket, for testing take_request.
     fn test_connection(bytes: &[u8]) -> Connection {
+        test_connection_with_limit(bytes, 1024)
+    }
+
+    fn test_connection_with_limit(bytes: &[u8], max_body: usize) -> Connection {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let stream = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let mut conn = Connection::new(mio::net::TcpStream::from_std(stream), 0);
         conn.read_buf = bytes.to_vec();
         let head = parse_head(&conn.read_buf).unwrap().unwrap();
-        let body = body_plan(&head, 1024).unwrap();
+        let body = body_plan(&head, max_body).unwrap();
         conn.pending = Some(Pending {
             head,
             body,
@@ -972,6 +1129,81 @@ mod tests {
         );
         assert!(resolve("", 8080).is_err());
         assert!(resolve("bad host!", 8080).is_err());
+    }
+
+    /// Feeds `body` in 64 KB pieces, like `fill()` does, and checks that
+    /// read_buf never holds more than the head plus one piece.
+    fn feed_in_pieces(conn: &mut Connection, servers: &[ServerConfig], body: &[u8]) -> Option<Request> {
+        let head_len = conn.read_buf.len();
+        for piece in body.chunks(64 * 1024) {
+            conn.read_buf.extend_from_slice(piece);
+            if let Some((request, _)) = take_request(conn, servers).unwrap() {
+                return Some(request);
+            }
+            assert!(conn.read_buf.len() <= head_len + 64 * 1024, "body piling up in RAM");
+        }
+        None
+    }
+
+    #[test]
+    fn big_body_goes_to_a_file_not_to_ram() {
+        let size = SPOOL_ABOVE + 100_000;
+        let servers = vec![ServerConfig {
+            client_max_body_size: 10 * SPOOL_ABOVE,
+            ..Default::default()
+        }];
+        let head = format!("POST /up HTTP/1.1\r\nHost: x\r\nContent-Length: {size}\r\n\r\n");
+        let mut conn = test_connection_with_limit(head.as_bytes(), 10 * SPOOL_ABOVE);
+        let body: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+        let mut with_next = body.clone();
+        with_next.extend_from_slice(b"GET /next HTTP/1.1\r\n");
+
+        let request = feed_in_pieces(&mut conn, &servers, &with_next).expect("request complete");
+        assert!(request.body.is_empty()); // nothing in memory...
+        let file = request.body_file.as_ref().expect("...the body is in a file");
+        assert_eq!(file.len(), size as u64);
+        assert_eq!(std::fs::read(file.path()).unwrap(), body);
+        assert!(conn.read_buf.starts_with(b"GET /next")); // pipelined request kept
+
+        let path = file.path().to_path_buf();
+        drop(request); // request handled
+        assert!(!path.exists(), "the temp file is deleted");
+    }
+
+    #[test]
+    fn big_chunked_body_goes_to_a_file() {
+        let servers = vec![ServerConfig {
+            client_max_body_size: 10 * SPOOL_ABOVE,
+            ..Default::default()
+        }];
+        let head = b"POST /up HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let mut conn = test_connection_with_limit(head, 10 * SPOOL_ABOVE);
+        let part = vec![b'z'; 700_000];
+        let mut raw = Vec::new();
+        for _ in 0..2 {
+            raw.extend_from_slice(format!("{:x}\r\n", part.len()).as_bytes());
+            raw.extend_from_slice(&part);
+            raw.extend_from_slice(b"\r\n");
+        }
+        raw.extend_from_slice(b"0\r\n\r\n");
+
+        let request = feed_in_pieces(&mut conn, &servers, &raw).expect("request complete");
+        let file = request.body_file.as_ref().expect("the body is in a file");
+        assert_eq!(file.len(), 1_400_000);
+        assert!(request.body.is_empty());
+    }
+
+    #[test]
+    fn small_body_stays_in_memory() {
+        let servers = vec![ServerConfig {
+            client_max_body_size: 1024,
+            ..Default::default()
+        }];
+        let mut conn =
+            test_connection(b"POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello");
+        let (request, _) = take_request(&mut conn, &servers).unwrap().unwrap();
+        assert_eq!(request.body, b"hello");
+        assert!(request.body_file.is_none());
     }
 
     #[test]

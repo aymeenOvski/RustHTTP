@@ -69,7 +69,7 @@ pub fn start_cgi_process(req: &Request, route: &RouteConfig, script: &Path) -> i
     cmd.env("SERVER_PROTOCOL", &req.version);
     cmd.env("REQUEST_METHOD", req.method.to_string());
     cmd.env("QUERY_STRING", req.query.as_deref().unwrap_or(""));
-    cmd.env("CONTENT_LENGTH", req.body.len().to_string());
+    cmd.env("CONTENT_LENGTH", req.body_len().to_string());
     cmd.env("CONTENT_TYPE", req.header("content-type").unwrap_or(""));
     cmd.env("PATH_INFO", &req.path);
     cmd.env("SCRIPT_NAME", &req.path);
@@ -84,8 +84,13 @@ pub fn start_cgi_process(req: &Request, route: &RouteConfig, script: &Path) -> i
         cmd.env(key, value);
     }
 
-    // we write the body to stdin and read the answer from stdout (piping).
-    cmd.stdin(Stdio::piped());
+    // A big body is already in a temporary file: that file becomes the
+    // script's stdin directly, nothing to copy. A small one is written into a
+    // pipe by the event loop. The answer is read from stdout (a pipe).
+    match &req.body_file {
+        Some(body_file) => cmd.stdin(Stdio::from(body_file.take_file()?)),
+        None => cmd.stdin(Stdio::piped()),
+    };
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::null());
 
@@ -280,6 +285,7 @@ mod tests {
             version: "HTTP/1.1".into(),
             headers: HashMap::new(),
             body: Vec::new(),
+            body_file: None,
         }
     }
 
@@ -435,6 +441,40 @@ mod tests {
         assert_eq!(run_to_end(&mut job), CgiRead::Eof);
         let text = String::from_utf8_lossy(&job.output).to_string();
         assert!(text.contains("got:hello"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_body_in_a_file_is_the_scripts_stdin() {
+        let dir = std::env::temp_dir().join(format!("cgi_file_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("count.py");
+        std::fs::write(
+            &script,
+            "import os, sys\n\
+             data = sys.stdin.buffer.read()\n\
+             print('Content-Type: text/plain')\n\
+             print()\n\
+             print(len(data), os.environ['CONTENT_LENGTH'])\n",
+        )
+        .unwrap();
+        let body_path = dir.join("body.tmp");
+        std::fs::write(&body_path, vec![b'b'; 2_000_000]).unwrap();
+        let body_file = std::fs::File::open(&body_path).unwrap();
+
+        let mut route = python_route();
+        route.root = Some(dir.clone());
+        let mut req = get_request("/count.py");
+        req.method = Method::Post;
+        req.body_file = Some(crate::http::BodyFile::new(body_path, 2_000_000, body_file));
+
+        let mut job = CgiJob::start(&req, &route, &script).unwrap();
+        assert!(job.stdin.is_none(), "no pipe: the script reads the file itself");
+        drop(req); // the temp file name is deleted; the script still has it open
+        assert_eq!(run_to_end(&mut job), CgiRead::Eof);
+        let text = String::from_utf8_lossy(&job.output).to_string();
+        assert!(text.contains("2000000 2000000"), "{text}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

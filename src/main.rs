@@ -8,6 +8,7 @@ mod error;
 mod http;
 mod router;
 mod server;
+mod spool;
 mod static_files;
 mod upload;
 mod utils;

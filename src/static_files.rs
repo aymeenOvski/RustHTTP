@@ -2,7 +2,7 @@
 use crate::config::{RouteConfig, ServerConfig};
 use crate::error::error_response;
 use crate::http::{Request, Response};
-use std::fs;
+use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -22,13 +22,7 @@ pub fn serve(req: &Request, route: &RouteConfig, server: &ServerConfig) -> Respo
         };
 
         match handle_delete(&target_path) {
-            Ok(code) => {
-                return Response {
-                    status: code,
-                    headers: vec![],
-                    body: vec![],
-                };
-            }
+            Ok(code) => return Response::new(code),
             Err(code) => return error_response(code, server),
         }
     }
@@ -62,11 +56,7 @@ pub fn serve(req: &Request, route: &RouteConfig, server: &ServerConfig) -> Respo
 
     // Convert Result to Response
     match result {
-        Ok((headers, body)) => Response {
-            status: 200,
-            headers,
-            body,
-        },
+        Ok(response) => response,
         Err(code) => error_response(code, server),
     }
 }
@@ -118,23 +108,20 @@ pub fn get_mime_type(path: &Path) -> &'static str {
     }
 }
 
-// Reads a file from disk and builds a 200 OK HTTP response
-pub fn serve_file(path: &Path) -> Result<(Vec<(String, String)>, Vec<u8>), u16> {
-    // Read file bytes from disk (returns 500 Internal Server Error if read fails)
-    let contents = match fs::read(path) {
-        Ok(data) => data,
-        Err(_) => return Err(500),
-    };
+// Opens a file and builds a 200 OK HTTP response that sends it.
+// The file is NOT read here: the network layer reads it piece by piece while
+// it sends it, so a 1 GB file never has to fit in RAM. Content-Length is
+// added from the file size.
+pub fn serve_file(path: &Path) -> Result<Response, u16> {
+    // Open the file (500 Internal Server Error if it cannot be opened)
+    let file = File::open(path).map_err(|_| 500u16)?;
+    let len = file.metadata().map_err(|_| 500u16)?.len();
 
     let mime_type = get_mime_type(path);
 
-    // Build headers
-    let headers = vec![
-        ("Content-Type".to_string(), mime_type.to_string()),
-        ("Content-Length".to_string(), contents.len().to_string()),
-    ];
-
-    Ok((headers, contents))
+    Ok(Response::new(200)
+        .with_header("Content-Type", mime_type)
+        .with_file(file, len))
 }
 
 // Handles directory requests (checks for index.html or generates autoindex)
@@ -143,7 +130,7 @@ pub fn handle_directory(
     request_uri: &str,
     index: Option<&str>, // NEW: the route's `index` from the config
     autoindex: bool,
-) -> Result<(Vec<(String, String)>, Vec<u8>), u16> {
+) -> Result<Response, u16> {
     // The route's default file (config `index`), or index.html if not set.
     let index_path = dir_path.join(index.unwrap_or("index.html"));
     if index_path.is_file() {
@@ -180,17 +167,10 @@ pub fn handle_directory(
     }
 
     html.push_str("</ul><hr></body></html>");
-    let body = html.into_bytes();
 
-    let headers = vec![
-        (
-            "Content-Type".to_string(),
-            "text/html; charset=utf-8".to_string(),
-        ),
-        ("Content-Length".to_string(), body.len().to_string()),
-    ];
-
-    Ok((headers, body))
+    Ok(Response::new(200)
+        .with_header("Content-Type", "text/html; charset=utf-8")
+        .with_body(html.into_bytes()))
 }
 
 // Safely deletes a file or empty directory from disk

@@ -1,17 +1,20 @@
 //! turns a `Response` into the bytes sent to the client.
-use super::{Response, reason_phrase};
+use super::{FileBody, Response, reason_phrase};
 
-/// A response ready to send, kept in two parts so the body is never copied.
+/// A response ready to send, kept in parts so the body is never copied.
 pub struct Wire {
     /// Status line, headers and the empty line that ends them.
     pub head: Vec<u8>,
     /// The body, moved out of the `Response`. Empty for 1xx, 204 and 304.
     pub body: Vec<u8>,
+    /// Or the body is a file, sent piece by piece after the head.
+    pub file: Option<FileBody>,
 }
 
 /// Builds the bytes of a response.
 ///
-/// - Adds `Content-Length` when the router did not set one.
+/// - Adds `Content-Length` when the router did not set one (for a file:
+///   its length, known before the first byte is read).
 /// - 1xx, 204 and 304 get no body and no `Content-Length` (RFC 9110).
 /// - CR and LF are removed from header names and values.
 ///
@@ -38,13 +41,21 @@ pub fn to_wire(resp: Response) -> Wire {
         head.push_str("\r\n");
     }
     if !has_length && !no_body {
-        head.push_str(&format!("Content-Length: {}\r\n", resp.body.len()));
+        head.push_str(&format!("Content-Length: {}\r\n", resp.body_len()));
     }
     head.push_str("\r\n");
 
+    if no_body {
+        return Wire {
+            head: head.into_bytes(),
+            body: Vec::new(),
+            file: None, // dropped here: the file is closed
+        };
+    }
     Wire {
         head: head.into_bytes(),
-        body: if no_body { Vec::new() } else { resp.body }, // moved, not copied
+        body: resp.body, // moved, not copied
+        file: resp.file,
     }
 }
 
@@ -94,6 +105,19 @@ mod tests {
         let text = String::from_utf8(on_the_wire(resp)).unwrap();
         assert!(text.contains("Location: /xSet-Cookie: evil=1\r\n"));
         assert!(!text.contains("\r\nSet-Cookie"));
+    }
+
+    #[test]
+    fn a_file_body_gets_its_length_and_stays_on_disk() {
+        let path = std::env::temp_dir().join(format!("wire_{}.bin", std::process::id()));
+        std::fs::write(&path, vec![b'z'; 3000]).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let wire = to_wire(Response::new(200).with_file(file, 3000));
+        let head = String::from_utf8(wire.head).unwrap();
+        assert!(head.contains("Content-Length: 3000\r\n"));
+        assert!(wire.body.is_empty()); // nothing was read into memory
+        assert_eq!(wire.file.map(|f| f.len), Some(3000));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

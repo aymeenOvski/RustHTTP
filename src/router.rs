@@ -10,12 +10,19 @@ use crate::http::{Request, Response};
 use crate::{static_files, upload};
 
 use crate::cgi::CgiJob;
+use crate::upload::UploadJob;
 use std::io;
 
 pub enum Outcome {
     Response(Response),
     Cgi {
         job: CgiJob,
+        set_cookie: Option<String>,
+    },
+    /// An upload to save: the event loop runs the job a piece per turn,
+    /// then sends `upload::upload_response`.
+    Upload {
+        job: UploadJob,
         set_cookie: Option<String>,
     },
 }
@@ -27,6 +34,12 @@ pub fn handle(req: &Request, server: &ServerConfig) -> Response {
     match dispatch(req, server) {
         Outcome::Response(r) => r,
         Outcome::Cgi { .. } => Response::text(501, "CGI needs the event loop\n"),
+        // Without the event loop (tests): save it all at once.
+        Outcome::Upload { mut job, .. } => loop {
+            if let Some(result) = job.step(usize::MAX) {
+                break upload::upload_response(result, server);
+            }
+        },
     }
 }
 
@@ -69,9 +82,6 @@ pub fn dispatch(req: &Request, server: &ServerConfig) -> Outcome {
 
     // Handle Redirections
     if let Some(ref target) = route.redirect {
-        if !route.methods.contains(&req.method) {
-            return Outcome::Response(error_response(405, server)); // 405 Method Not Allowed
-        }
         return Outcome::Response(
             Response::new(301)
                 .with_header("Location", target)
@@ -81,7 +91,7 @@ pub fn dispatch(req: &Request, server: &ServerConfig) -> Outcome {
 
     // Validate if the HTTP method is allowed for this route
     if !route.methods.contains(&req.method) {
-        return Outcome::Response(error_response(405, server)); // 405 Method Not Allowed
+        return Outcome::Response(error_response(405, server)); // Method not allowed -> 405 Method Not Allowed
     }
 
     // Dispatch to CGI if the file extension matches a CGI rule
@@ -111,14 +121,17 @@ pub fn dispatch(req: &Request, server: &ServerConfig) -> Outcome {
 
     // Dispatch to Upload Handler if it's a POST request and an upload directory is set
     if req.method == crate::http::Method::Post && route.upload_dir.is_some() {
-        let mut resp = upload::handle_upload(req, route, server);
-        if is_new_session {
-            resp = resp.with_header(
-                "Set-Cookie",
-                &format!("session_id={actual_session_id}; Path=/; HttpOnly"),
-            );
-        }
-        return Outcome::Response(resp);
+        let set_cookie =
+            is_new_session.then(|| format!("session_id={actual_session_id}; Path=/; HttpOnly"));
+        return match upload::start_upload(req, route, server) {
+            Ok(job) => Outcome::Upload { job, set_cookie },
+            Err(mut resp) => {
+                if let Some(cookie) = &set_cookie {
+                    resp = resp.with_header("Set-Cookie", cookie);
+                }
+                Outcome::Response(resp)
+            }
+        };
     }
 
     // Default Fallback: Hand off to Static Files (Handles GET, file downloads, autoindex, and DELETE)
@@ -203,6 +216,7 @@ mod route_matching_tests {
             version: "HTTP/1.1".to_string(),
             headers: HashMap::new(),
             body: Vec::new(),
+            body_file: None,
         }
     }
 
@@ -293,7 +307,7 @@ mod route_matching_tests {
             routes: routes(),
             ..Default::default()
         };
-        let response = handle(&request(Method::Delete, "/old"), &server);
+        let response = handle(&request(Method::Delete, "/docs"), &server);
         assert_eq!(response.status, 405);
     }
 

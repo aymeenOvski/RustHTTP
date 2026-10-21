@@ -64,6 +64,7 @@ impl RequestHead {
             version: self.version,
             headers: self.headers,
             body,
+            body_file: None,
         }
     }
 }
@@ -215,8 +216,11 @@ pub struct ChunkedDecoder {
     /// Position in `raw` (the bytes after the head) where we stopped.
     pos: usize,
     state: ChunkState,
-    /// The real body: chunk data only, no sizes, no "\r\n".
+    /// The decoded body not taken out yet: chunk data only, no sizes, no "\r\n".
     body: Vec<u8>,
+    /// All decoded bytes so far, including those already taken out with
+    /// `take_body` (big bodies move to a file). The size limit uses this.
+    total: usize,
     /// Trailer bytes seen so far, limited by `MAX_TRAILERS`.
     trailer_bytes: usize,
 }
@@ -227,6 +231,7 @@ impl ChunkedDecoder {
             pos: 0,
             state: ChunkState::Size,
             body: Vec::new(),
+            total: 0,
             trailer_bytes: 0,
         }
     }
@@ -260,7 +265,7 @@ impl ChunkedDecoder {
                     if size == 0 {
                         self.state = ChunkState::Trailers;
                     } else {
-                        if self.body.len().saturating_add(size) > max_body {
+                        if self.total.saturating_add(size) > max_body {
                             return Err(ParseError::PayloadTooLarge);
                         }
                         self.state = ChunkState::Data(size);
@@ -273,6 +278,7 @@ impl ChunkedDecoder {
                     }
                     let take = missing.min(available);
                     self.body.extend_from_slice(&raw[self.pos..self.pos + take]);
+                    self.total += take;
                     self.pos += take;
                     if take < missing {
                         self.state = ChunkState::Data(missing - take);
@@ -337,7 +343,12 @@ impl ChunkedDecoder {
         std::mem::take(&mut self.pos)
     }
 
-    /// The decoded body. Call once `advance` returned Ok(true).
+    /// Bytes decoded and not taken out yet.
+    pub fn decoded_len(&self) -> usize {
+        self.body.len()
+    }
+
+    /// Takes the decoded bytes out (all of them, or the part decoded so far).
     pub fn take_body(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.body)
     }
@@ -670,6 +681,17 @@ mod tests {
             d.advance(b"40000000\r\n", 1024),
             Err(ParseError::PayloadTooLarge)
         );
+    }
+
+    #[test]
+    fn the_limit_counts_bytes_already_taken_out() {
+        // Body moved out piece by piece (as when it goes to a file):
+        // 8 + 8 bytes with a 10-byte limit must still be refused.
+        let mut d = ChunkedDecoder::new();
+        assert_eq!(d.advance(b"8\r\naaaaaaaa\r\n", 10), Ok(false));
+        assert_eq!(d.take_body(), b"aaaaaaaa");
+        let raw = b"8\r\naaaaaaaa\r\n8\r\nbbbbbbbb\r\n";
+        assert_eq!(d.advance(raw, 10), Err(ParseError::PayloadTooLarge));
     }
 
     #[test]
