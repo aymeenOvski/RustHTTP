@@ -56,47 +56,90 @@ Lines starting with `#` are comments. Paths are relative to where you run the se
 ### Example
 
 ```ini
-# ── Server "main": two ports, default server ──
+# ==========================================
+# SERVER 1: Main Web & Static Server
+# ==========================================
 [server.main]
 host = 127.0.0.1
-ports = 8080, 8081
-server_names = localhost
+ports = 8080, 8090
+server_names = localhost, main.local
 is_default = true
-client_max_body_size = 1000000
-error_404 = error_pages/404.html
-error_403 = error_pages/403.html
+client_max_body_size = 1048576
 
+# Custom error pages mapped to static files
+error_400 = error_pages/400.html # Bad Request
+error_403 = error_pages/403.html
+error_404 = error_pages/404.html
+error_405 = error_pages/405.html
+error_413 = error_pages/413.html
+error_500 = error_pages/500.html
+
+# Home route (Root directory)
 [route.main./]
 root = www
 methods = GET
 index = index.html
 autoindex = false
 
-[route.main./upload]
+# Uploads and file management route (Supports DELETE and uploads)
+[route.main./files]
 root = www/uploads
-methods = GET, POST, DELETE
 upload_dir = www/uploads
-autoindex = true
+methods = GET, POST, DELETE
+autoindex = true 
 
-[route.main./old]
-methods = GET
+# Redirection route
+[route.main./old-page]
 redirect = /
 
-[route.main./cgi-bin]
+# CGI script execution route (.py extension)
+[route.main./cgi]
 root = cgi-bin
 methods = GET, POST
 cgi_extension = .py
 
-# ── Server "small": another host name and a tiny body limit ──
-[server.small]
+
+# ==========================================
+# SERVER 2: Secondary API / Testing Server (Shares Port 8080 via Virtual Hosting)
+# ==========================================
+[server.api]
 host = 127.0.0.1
 ports = 8080
-server_names = small.local
-client_max_body_size = 100
+server_names = test.com, api.local
+is_default = false
+client_max_body_size = 5242880
 
-[route.small./]
+# Custom error pages mapped to static files
+error_400 = error_pages/400.html
+error_403 = error_pages/403.html
+error_404 = error_pages/404.html
+error_405 = error_pages/405.html
+error_413 = error_pages/413.html
+error_500 = error_pages/500.html
+
+# Home route (Root directory)
+[route.api./]
 root = www
 methods = GET
+index = index.html
+autoindex = false
+
+# Uploads and file management route (Supports DELETE and uploads)
+[route.api./files]
+root = www/uploads
+upload_dir = www/uploads
+methods = GET, POST, DELETE
+autoindex = true 
+
+# Redirection route
+[route.api./old-page]
+redirect = /
+
+# CGI script execution route (.py extension)
+[route.api./cgi]
+root = cgi-bin
+methods = GET, POST
+cgi_extension = .py
 ```
 
 Here `main` and `small` share port 8080. The server tells them apart by the `Host` header.
