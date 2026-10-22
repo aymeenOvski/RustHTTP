@@ -46,8 +46,14 @@ pub fn load(path: &str) -> Result<Config, String> {
     let mut section_type = "";
 
     for line in content.lines() {
+        let mut line = line.trim();
+
+        if let Some(idx) = line.find('#') {
+            line = &line[..idx];
+        }
         let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
+
+        if line.is_empty() {
             continue;
         }
 
