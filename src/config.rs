@@ -191,9 +191,9 @@ pub fn validate(config: &Config) -> Result<(), String> {
     }
 
     for server in &config.servers {
-        if server.client_max_body_size == 0 || server.client_max_body_size > 1 << 40 {
+        if server.client_max_body_size == 0 {
             return Err(
-                "Configuration Error: client_max_body_size must be between 1 and 1 GiB".to_string(),
+                "Configuration Error: client_max_body_size must be a positive value".to_string(),
             );
         }
         for (code, page) in &server.error_pages {
