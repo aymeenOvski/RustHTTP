@@ -180,6 +180,12 @@ pub fn handle_delete(target_path: &Path) -> Result<u16, u16> {
         return Err(404); // Not Found
     }
 
+    // Check if the target is writable
+    let can_write = std::fs::OpenOptions::new().write(true).open(&target_path).is_ok();
+    if !can_write {
+        return Err(403); // Forbidden: cannot write/delete
+    }
+
     // Delete file vs empty directory
     let result = if target_path.is_dir() {
         // ! fs::remove_dir only deletes *empty* directories safely
