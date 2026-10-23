@@ -114,14 +114,23 @@ pub fn get_mime_type(path: &Path) -> &'static str {
 // added from the file size.
 pub fn serve_file(path: &Path) -> Result<Response, u16> {
     // Open the file (500 Internal Server Error if it cannot be opened)
-    let file = File::open(path).map_err(|_| 500u16)?;
-    let len = file.metadata().map_err(|_| 500u16)?.len();
+    let file = File::open(path).map_err(|e| status_for(&e))?;
+    let len = file.metadata().map_err(|e| status_for(&e))?.len();
 
     let mime_type = get_mime_type(path);
 
     Ok(Response::new(200)
         .with_header("Content-Type", mime_type)
         .with_file(file, len))
+}
+
+// Picks the HTTP status that matches an I/O error.
+fn status_for(e: &io::Error) -> u16 {
+    match e.kind() {
+        io::ErrorKind::NotFound => 404,
+        io::ErrorKind::PermissionDenied => 403,
+        _ => 500,
+    }
 }
 
 // Handles directory requests (checks for index.html or generates autoindex)
@@ -153,7 +162,7 @@ pub fn handle_directory(
     // let entries = fs::read_dir(dir_path).map_err(|_| 500)?;
     let entries = match fs::read_dir(dir_path) {
         Ok(entries) => entries,
-        Err(_) => return Err(500),
+        Err(e) => return Err(status_for(&e)),
     };
 
     for entry in entries.flatten() {
@@ -181,7 +190,10 @@ pub fn handle_delete(target_path: &Path) -> Result<u16, u16> {
     }
 
     // Check if the target is writable
-    let can_write = std::fs::OpenOptions::new().write(true).open(&target_path).is_ok();
+    let can_write = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&target_path)
+        .is_ok();
     if !can_write {
         return Err(403); // Forbidden: cannot write/delete
     }
@@ -196,7 +208,39 @@ pub fn handle_delete(target_path: &Path) -> Result<u16, u16> {
 
     // Return success code 204 (No Content) or 500 on failure
     match result {
-        Ok(_) => Ok(204),   // HTTP 204 No Content
-        Err(_) => Err(500), // Internal Server Error (e.g., permission denied)
+        Ok(_) => Ok(204),
+        Err(e) => Err(status_for(&e)),
+    }
+}
+
+
+#[cfg(test)]
+mod permission_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn locked_file(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(name);
+        fs::write(&path, "secret").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        path
+    }
+
+    #[test]
+    fn unreadable_file_is_403() {
+        let path = locked_file("perm_get_test.txt");
+        let result = serve_file(&path);
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o644));
+        let _ = fs::remove_file(&path);
+        assert_eq!(result.err(), Some(403));
+    }
+
+    #[test]
+    fn undeletable_file_is_403() {
+        let path = locked_file("perm_delete_test.txt");
+        let result = handle_delete(&path);
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o644));
+        let _ = fs::remove_file(&path);
+        assert_eq!(result, Err(403));
     }
 }
