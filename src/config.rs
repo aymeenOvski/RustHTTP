@@ -168,28 +168,44 @@ pub fn load(path: &str) -> Result<Config, String> {
 
 // Startup validation to catch duplicate ports and configuration errors.
 pub fn validate(config: &Config) -> Result<(), String> {
-    // Servers may share a port (virtual hosts), but not the same name on it.
-    let mut seen = std::collections::HashSet::new();
+    if config.servers.is_empty() {
+        return Err("Configuration Error: No servers defined in configuration file!".to_string());
+    }
 
+    // The same port written twice in ONE server.
     for server in &config.servers {
-        // On one host:port, at most one server may be the default.
-        let mut defaults: HashMap<(String, u16), usize> = HashMap::new();
-        for server in &config.servers {
-            if !server.is_default {
-                continue;
-            }
-            for port in &server.ports {
-                let count = defaults.entry((server.host.clone(), *port)).or_insert(0);
-                *count += 1;
-                if *count > 1 {
-                    return Err(format!(
-                        "Configuration Error: more than one default server on {}:{}",
-                        server.host, port
-                    ));
-                }
+        let mut ports_seen = std::collections::HashSet::new();
+        for port in &server.ports {
+            if !ports_seen.insert(*port) {
+                return Err(format!(
+                    "Configuration Error: port {} is listed twice in the same server",
+                    port
+                ));
             }
         }
+    }
 
+    // On one host:port, at most one server may be the default.
+    let mut defaults: HashMap<(String, u16), usize> = HashMap::new();
+    for server in &config.servers {
+        if !server.is_default {
+            continue;
+        }
+        for port in &server.ports {
+            let count = defaults.entry((server.host.clone(), *port)).or_insert(0);
+            *count += 1;
+            if *count > 1 {
+                return Err(format!(
+                    "Configuration Error: more than one default server on {}:{}",
+                    server.host, port
+                ));
+            }
+        }
+    }
+
+    // Servers may share a port (virtual hosts), but not the same name on it.
+    let mut seen = std::collections::HashSet::new();
+    for server in &config.servers {
         // A server without names counts as one unnamed server.
         let names: Vec<String> = if server.server_names.is_empty() {
             vec![String::new()]
@@ -210,10 +226,6 @@ pub fn validate(config: &Config) -> Result<(), String> {
                 }
             }
         }
-    }
-
-    if config.servers.is_empty() {
-        return Err("Configuration Error: No servers defined in configuration file!".to_string());
     }
 
     for server in &config.servers {
@@ -483,5 +495,15 @@ mod tests {
     fn a_missing_error_page_is_refused() {
         let text = server("a", "8080", "error_404 = /no/such/page.html");
         assert!(load_text("page", &text).is_err());
+    }
+
+    #[test]
+    fn a_repeated_port_message_names_the_port() {
+        let err = load_text(
+            "repeat_msg",
+            &server("a", "8080, 8080", "is_default = true"),
+        )
+        .unwrap_err();
+        assert!(err.contains("listed twice"), "{err}");
     }
 }
