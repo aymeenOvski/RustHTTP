@@ -97,6 +97,7 @@ pub fn load(path: &str) -> Result<Config, String> {
                 if let Some(ref mut s) = current_server {
                     match key {
                         "host" => s.host = val.to_string(),
+                        "ports" if val.is_empty() => {}
                         "ports" => {
                             s.ports = val
                                 .split(',')
@@ -160,6 +161,7 @@ pub fn load(path: &str) -> Result<Config, String> {
         config.servers.push(s);
     }
 
+    apply_defaults(&mut config);
     validate(&config)?;
     Ok(config)
 }
@@ -230,6 +232,18 @@ pub fn validate(config: &Config) -> Result<(), String> {
             }
         }
         for route in &server.routes {
+            if !route.path.starts_with('/') {
+                return Err(format!(
+                    "Configuration Error: route path must start with '/': {}",
+                    route.path
+                ));
+            }
+            if route.root.is_none() && route.redirect.is_none() {
+                return Err(format!(
+                    "Configuration Error: route {} needs a root or a redirect",
+                    route.path
+                ));
+            }
             if let Some(root) = &route.root {
                 if !root.is_dir() {
                     return Err(format!(
@@ -244,10 +258,80 @@ pub fn validate(config: &Config) -> Result<(), String> {
     Ok(())
 }
 
+// Fills in the values we can safely guess. Runs BEFORE validate.
+fn apply_defaults(config: &mut Config) {
+    for server in &mut config.servers {
+        if server.host.is_empty() {
+            server.host = "127.0.0.1".to_string();
+        }
+        if server.ports.is_empty() {
+            server.ports = vec![8080];
+        }
+        for route in &mut server.routes {
+            if route.methods.is_empty() {
+                route.methods = vec![Method::Get];
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn an_empty_ports_value_listens_on_8080() {
+        let text = "[server.a]\nhost = 127.0.0.1\nports =\n\n[route.a./]\nroot = src\n";
+        let config = load_text("emptyports", text).unwrap();
+        assert_eq!(config.servers[0].ports, vec![8080]);
+    }
+
+    #[test]
+    fn a_wrong_ports_value_is_still_refused() {
+        let text = "[server.a]\nports = 8080,\n\n[route.a./]\nroot = src\n";
+        assert!(load_text("trailingcomma", text).is_err());
+    }
+
+    #[test]
+    fn missing_host_and_methods_get_defaults() {
+        let text = "[server.a]\nports = 8080\n\n[route.a./]\nroot = src\n";
+        let config = load_text("defaults", text).unwrap();
+        assert_eq!(config.servers[0].host, "127.0.0.1");
+        assert_eq!(config.servers[0].routes[0].methods, vec![Method::Get]);
+    }
+
+    #[test]
+    fn a_route_path_without_slash_is_refused() {
+        let text = "[server.a]\nports = 8080\n\n[route.a.docs]\nroot = src\n";
+        assert!(load_text("badpath", text).is_err());
+    }
+
+    #[test]
+    fn a_route_without_root_or_redirect_is_refused() {
+        let text = "[server.a]\nports = 8080\n\n[route.a./]\nmethods = GET\n";
+        assert!(load_text("noroot", text).is_err());
+    }
+
+    #[test]
+    fn a_redirect_only_route_is_fine() {
+        let text = "[server.a]\nports = 8080\n\n[route.a./old]\nredirect = /\n";
+        assert!(load_text("redirect", text).is_ok());
+    }
+
+    #[test]
+    fn a_server_without_ports_listens_on_8080() {
+        let text = "[server.a]\nhost = 127.0.0.1\n\n[route.a./]\nroot = src\n";
+        let config = load_text("noports", text).unwrap();
+        assert_eq!(config.servers[0].ports, vec![8080]);
+    }
+
+    #[test]
+    fn two_unnamed_servers_without_ports_clash_on_8080() {
+        let text = "[server.a]\n\n[route.a./]\nroot = src\n\n\
+                    [server.b]\n\n[route.b./]\nroot = src\n";
+        assert!(load_text("noports_twice", text).is_err());
+    }
 
     #[test]
     fn two_defaults_on_one_port_are_refused() {
