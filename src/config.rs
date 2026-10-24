@@ -1,5 +1,3 @@
-//! Owner: Person B — parsing + validation.
-//! The STRUCTS below are SHARED CONTRACT.
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
@@ -20,8 +18,9 @@ pub struct ServerConfig {
     pub client_max_body_size: usize,
     pub error_pages: HashMap<u16, PathBuf>,
     pub routes: Vec<RouteConfig>,
+    // A parse error found in this server's section. Makes `check_server` skip it.
+    pub parse_error: Option<String>,
 }
-
 #[derive(Debug, Clone, Default)]
 pub struct RouteConfig {
     pub path: String,
@@ -33,6 +32,17 @@ pub struct RouteConfig {
     /// extension (e.g. ".py") -> interpreter path
     pub cgi: HashMap<String, PathBuf>,
     pub upload_dir: Option<PathBuf>,
+    // A parse error found in this route. Makes `check_server` skip the server.
+    pub parse_error: Option<String>,
+}
+
+// Only "true" or "false" are accepted for yes/no settings.
+fn parse_bool(val: &str) -> Result<bool, String> {
+    match val {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(format!("expected true or false, got '{}'", val)),
+    }
 }
 
 // Loads, parses, and validates our custom section-based config file from disk.
@@ -99,7 +109,7 @@ pub fn load(path: &str) -> Result<Config, String> {
                         "host" => s.host = val.to_string(),
                         "ports" if val.is_empty() => {}
                         "ports" => {
-                            s.ports = val
+                            let parsed = val
                                 .split(',')
                                 .map(|p| {
                                     p.trim()
@@ -108,23 +118,38 @@ pub fn load(path: &str) -> Result<Config, String> {
                                         .filter(|&n| n != 0)
                                         .ok_or_else(|| format!("Invalid port '{}'", p.trim()))
                                 })
-                                .collect::<Result<Vec<u16>, String>>()?;
+                                .collect::<Result<Vec<u16>, String>>();
+                            match parsed {
+                                Ok(list) => s.ports = list,
+                                Err(e) => s.parse_error = Some(e),
+                            }
                         }
                         "server_names" => {
                             s.server_names = val.split(',').map(|n| n.trim().to_string()).collect();
                         }
-                        "is_default" => s.is_default = val.parse().unwrap_or(false),
-                        "client_max_body_size" => {
-                            s.client_max_body_size = val
-                                .parse()
-                                .map_err(|_| format!("Invalid client_max_body_size '{}'", val))?
-                        }
+                        "is_default" => match parse_bool(val) {
+                            Ok(b) => s.is_default = b,
+                            Err(e) => s.parse_error = Some(format!("is_default: {e}")),
+                        },
+                        "client_max_body_size" => match val.parse() {
+                            Ok(n) => s.client_max_body_size = n,
+                            Err(_) => {
+                                s.parse_error =
+                                    Some(format!("Invalid client_max_body_size '{}'", val))
+                            }
+                        },
                         k if k.starts_with("error_") => {
-                            if let Ok(code) = k.trim_start_matches("error_").parse::<u16>() {
-                                s.error_pages.insert(code, PathBuf::from(val));
+                            match k.trim_start_matches("error_").parse::<u16>() {
+                                Ok(code) if (400..=599).contains(&code) => {
+                                    s.error_pages.insert(code, PathBuf::from(val));
+                                }
+                                _ => {
+                                    s.parse_error =
+                                        Some(format!("invalid error page setting '{k}'"))
+                                }
                             }
                         }
-                        _ => {}
+                        other => s.parse_error = Some(format!("unknown server setting '{other}'")),
                     }
                 }
             } else if section_type == "route" {
@@ -132,20 +157,35 @@ pub fn load(path: &str) -> Result<Config, String> {
                     match key {
                         "root" => r.root = Some(PathBuf::from(val)),
                         "methods" => {
-                            r.methods = val
-                                .split(',')
-                                .filter_map(|m| Method::parse(m.trim()))
-                                .collect();
+                            r.methods.clear();
+                            for m in val.split(',') {
+                                match Method::parse(m.trim()) {
+                                    Some(method) => r.methods.push(method),
+                                    None => {
+                                        r.parse_error = Some(format!(
+                                            "unknown method '{}' (allowed: GET, POST, DELETE)",
+                                            m.trim()
+                                        ))
+                                    }
+                                }
+                            }
                         }
                         "index" => r.index = Some(val.to_string()),
-                        "autoindex" => r.autoindex = val.parse().unwrap_or(false),
+                        "autoindex" => match parse_bool(val) {
+                            Ok(b) => r.autoindex = b,
+                            Err(e) => r.parse_error = Some(format!("autoindex: {e}")),
+                        },
                         "redirect" => r.redirect = Some(val.to_string()),
                         "upload_dir" => r.upload_dir = Some(PathBuf::from(val)),
-                        "cgi_extension" => {
+                        "cgi_extension" if val.starts_with('.') => {
                             r.cgi
                                 .insert(val.to_string(), PathBuf::from("/usr/bin/python3"));
                         }
-                        _ => {}
+                        "cgi_extension" => {
+                            r.parse_error =
+                                Some(format!("cgi_extension must start with '.', got '{val}'"))
+                        }
+                        other => r.parse_error = Some(format!("unknown route setting '{other}'")),
                     }
                 }
             }
@@ -162,27 +202,29 @@ pub fn load(path: &str) -> Result<Config, String> {
     }
 
     apply_defaults(&mut config);
+
+    // checks ONE server on its own. An error here only disables this server.
+    let mut valid = Vec::new();
+    for server in std::mem::take(&mut config.servers) {
+        match check_server(&server) {
+            Ok(()) => valid.push(server),
+            Err(e) => eprintln!(
+                "warning: server {:?} on {}:{:?} skipped: {}",
+                server.server_names, server.host, server.ports, e
+            ),
+        }
+    }
+    config.servers = valid;
+
     validate(&config)?;
     Ok(config)
 }
 
 // Startup validation to catch duplicate ports and configuration errors.
+// These are conflicts BETWEEN servers, so they stay fatal.
 pub fn validate(config: &Config) -> Result<(), String> {
     if config.servers.is_empty() {
         return Err("Configuration Error: No servers defined in configuration file!".to_string());
-    }
-
-    // The same port written twice in ONE server.
-    for server in &config.servers {
-        let mut ports_seen = std::collections::HashSet::new();
-        for port in &server.ports {
-            if !ports_seen.insert(*port) {
-                return Err(format!(
-                    "Configuration Error: port {} is listed twice in the same server",
-                    port
-                ));
-            }
-        }
     }
 
     // On one host:port, at most one server may be the default.
@@ -220,53 +262,63 @@ pub fn validate(config: &Config) -> Result<(), String> {
             for name in &names {
                 if !seen.insert((server.host.clone(), *port, name.clone())) {
                     return Err(format!(
-                        "Configuration Error: Port {} is configured multiple times for the same server name ({:?})!",
-                        port, name
+                        "Configuration Error: Multiple servers are configured for the same host:port ({}:{}) and server name ({:?})!",
+                        server.host, port, name
                     ));
                 }
             }
         }
     }
 
-    for server in &config.servers {
-        if server.client_max_body_size == 0 {
-            return Err(
-                "Configuration Error: client_max_body_size must be a positive value".to_string(),
-            );
-        }
-        for (code, page) in &server.error_pages {
-            if !page.is_file() {
-                return Err(format!(
-                    "Configuration Error: error page for {} not found: {}",
-                    code,
-                    page.display()
-                ));
-            }
-        }
-        for route in &server.routes {
-            if !route.path.starts_with('/') {
-                return Err(format!(
-                    "Configuration Error: route path must start with '/': {}",
-                    route.path
-                ));
-            }
-            if route.root.is_none() && route.redirect.is_none() {
-                return Err(format!(
-                    "Configuration Error: route {} needs a root or a redirect",
-                    route.path
-                ));
-            }
-            if let Some(root) = &route.root {
-                if !root.is_dir() {
-                    return Err(format!(
-                        "Configuration Error: root folder not found: {}",
-                        root.display()
-                    ));
-                }
-            }
+    Ok(())
+}
+
+// checks ONE server on its own. An error here only disables this server.
+fn check_server(server: &ServerConfig) -> Result<(), String> {
+    if let Some(e) = &server.parse_error {
+        return Err(e.clone());
+    }
+
+    if server.client_max_body_size == 0 {
+        return Err("client_max_body_size must be a positive value".to_string());
+    }
+
+    // Checks this specific server for duplicate ports
+    let mut ports_seen = std::collections::HashSet::new();
+    for port in &server.ports {
+        if !ports_seen.insert(*port) {
+            return Err(format!(
+                "Configuration Error: port {} is listed twice in the same server",
+                port
+            ));
         }
     }
 
+    for (code, page) in &server.error_pages {
+        if !page.is_file() {
+            return Err(format!(
+                "error page for {} not found: {}",
+                code,
+                page.display()
+            ));
+        }
+    }
+    for route in &server.routes {
+        if let Some(e) = &route.parse_error {
+            return Err(format!("route {}: {}", route.path, e));
+        }
+        if !route.path.starts_with('/') {
+            return Err(format!("route path must start with '/': '{}'", route.path));
+        }
+        if route.root.is_none() && route.redirect.is_none() {
+            return Err(format!("route {} needs a root or a redirect", route.path));
+        }
+        if let Some(root) = &route.root {
+            if !root.is_dir() {
+                return Err(format!("root folder not found: {}", root.display()));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -358,23 +410,6 @@ mod tests {
         let text = server("a", "8080", "server_names = a.com\nis_default = true")
             + &server("b", "9090", "server_names = b.com\nis_default = true");
         assert!(load_text("defaults_ok", &text).is_ok());
-    }
-
-    #[test]
-    fn test_duplicate_port_validation() {
-        let mut config = Config::default();
-        config.servers.push(ServerConfig {
-            ports: vec![8080],
-            ..Default::default()
-        });
-        config.servers.push(ServerConfig {
-            ports: vec![8080], // Duplicate!
-            ..Default::default()
-        });
-
-        let result = validate(&config);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("configured multiple times"));
     }
 
     #[test]
@@ -497,13 +532,54 @@ mod tests {
         assert!(load_text("page", &text).is_err());
     }
 
+    // one broken server must not stop the others.
     #[test]
-    fn a_repeated_port_message_names_the_port() {
-        let err = load_text(
-            "repeat_msg",
-            &server("a", "8080, 8080", "is_default = true"),
-        )
-        .unwrap_err();
-        assert!(err.contains("listed twice"), "{err}");
+    fn a_broken_server_is_skipped_and_the_other_works() {
+        let broken = "[server.bad]\nhost = 127.0.0.1\nports = 8080\nserver_names = bad.com\n\n\
+                      [route.bad.]\nroot = src\n\n";
+        let good = server("good", "8080", "server_names = good.com");
+        let config = load_text("skip_bad", &(broken.to_string() + &good)).unwrap();
+        assert_eq!(config.servers.len(), 1);
+        assert_eq!(config.servers[0].server_names, vec!["good.com"]);
+    }
+
+    #[test]
+    fn a_server_with_a_bad_value_is_skipped_and_the_other_works() {
+        let bad = server(
+            "bad",
+            "8080",
+            "server_names = bad.com\nclient_max_body_size = asd",
+        );
+        let good = server("good", "8080", "server_names = good.com");
+        let config = load_text("skip_parse", &(bad + &good)).unwrap();
+        assert_eq!(config.servers.len(), 1);
+        assert_eq!(config.servers[0].server_names, vec!["good.com"]);
+    }
+
+    #[test]
+    fn an_unknown_method_skips_that_server() {
+        let bad = "[server.bad]\nports = 8080\nserver_names = bad.com\n\n\
+                   [route.bad./]\nroot = src\nmethods = GET, TRASH\n\n";
+        let good = server("good", "8080", "server_names = good.com");
+        let config = load_text("trash", &(bad.to_string() + &good)).unwrap();
+        assert_eq!(config.servers.len(), 1);
+        assert_eq!(config.servers[0].server_names, vec!["good.com"]);
+    }
+
+    #[test]
+    fn yes_no_settings_only_accept_true_or_false() {
+        let bad = "[server.bad]\nports = 8080\nserver_names = bad.com\n\n\
+                   [route.bad./]\nroot = src\nautoindex = yes\n\n";
+        let good = server("good", "8080", "server_names = good.com");
+        let config = load_text("autoindex", &(bad.to_string() + &good)).unwrap();
+        assert_eq!(config.servers.len(), 1);
+    }
+
+    #[test]
+    fn an_unknown_setting_skips_that_server() {
+        let bad = server("bad", "8080", "server_names = bad.com\nhots = x");
+        let good = server("good", "8080", "server_names = good.com");
+        let config = load_text("unknown_key", &(bad + &good)).unwrap();
+        assert_eq!(config.servers.len(), 1);
     }
 }
