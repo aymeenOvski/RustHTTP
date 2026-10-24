@@ -1,34 +1,38 @@
 # LocalServer
 
-A small HTTP/1.1 server written in **Rust** from scratch. One process, one thread, non-blocking I/O with [`mio`](https://docs.rs/mio). No web frameworks, no async runtimes.
+A small HTTP/1.1 server written in Rust from scratch. One process, one thread, non-blocking I/O with `mio`. No web frameworks, no async runtimes.
 
 ## Features
 
-- `GET`, `POST`, `DELETE`
-- Multiple servers and ports, plus virtual hosts (chosen by the `Host` header)
-- Static files, default index file, optional directory listing
-- Custom error pages (400, 403, 404, 405, 413, 500)
-- Redirections and per-route allowed methods
-- Chunked and unchunked request bodies, keep-alive, `100-continue`
-- File uploads (multipart)
-- Cookies and sessions
-- CGI (Python), run without ever blocking the event loop
-- Timeouts (slow clients, stalled writes, long CGI scripts)
-- A panic in one request closes only that connection, not the server
+- **Methods:** GET, POST, DELETE
+- **Virtual Hosting:** Multiple servers and ports, plus virtual hosts (chosen by the `Host` header)
+- **Static Files:** Default index file, optional directory listing (`autoindex`), and file deletion
+- **Custom Error Pages:** Configurable error pages (400, 403, 404, 405, 413, 500)
+- **Routing:** Redirections and per-route allowed methods
+- **Request Bodies:** Chunked and unchunked request bodies, keep-alive, 100-continue, and disk spooling
+- **Uploads:** File uploads (multipart)
+- **State & Sessions:** Cookies and sessions
+- **CGI Support:** CGI (Python), run without ever blocking the event loop
+- **Timeouts:** Handlers for slow clients, stalled writes, and long CGI scripts
+- **Fault Isolation:** A panic in one request closes only that connection, not the server
 
-## Quick start
+---
+
+## Quick Start
 
 ```bash
-cargo run --release                 # uses ./config.conf
-cargo run --release -- my.conf      # or pass your own config
-cargo test                          # run the unit tests
+cargo run --release                 # Uses ./config.conf
+cargo run --release -- my.conf      # Or pass your own config
+cargo test                          # Run the unit tests
 ```
 
-Requirements: Rust (edition 2024) and `python3` at `/usr/bin/python3` if you use CGI.
+> **Requirements:** Rust (edition 2024) and `python3` at `/usr/bin/python3` if you use CGI.
 
-## Project layout
+---
 
-```
+## Project Layout
+
+```text
 src/
 ├── main.rs           entry point: load config, start server
 ├── config.rs         config parsing + validation
@@ -36,18 +40,28 @@ src/
 ├── connection.rs     one client: buffers, state machine, timeouts
 ├── http/             request parser (incl. chunked) and response serializer
 ├── router.rs         picks the route, checks methods, dispatches
+├── spool.rs          disk spooling for large bodies and temporary files
 ├── static_files.rs   files, index, directory listing, DELETE
 ├── upload.rs         multipart uploads
 ├── cgi.rs            CGI processes
 ├── error.rs          error responses
 └── utils/            cookies and sessions
+
+tests/
+├── memory_leak.md    Valgrind and memory verification guide
+├── stress.py         Python concurrent load testing script
+├── cgi.sh            CGI functionality test suite
+├── body_limit.sh     Client body size limit test suite
+└── methods.sh        HTTP methods and routing test suite
+
 www/  cgi-bin/  error_pages/  config.conf
 ```
+
+---
 
 ## Configuration
 
 The config is a simple INI-like file with two kinds of sections:
-
 - `[server.<name>]`: a server (host, ports, limits, error pages)
 - `[route.<server name>.<path>]`: a route that belongs to that server
 
@@ -98,7 +112,6 @@ root = cgi-bin
 methods = GET, POST
 cgi_extension = .py
 
-
 # ==========================================
 # SERVER 2: Secondary API / Testing Server (Shares Port 8080 via Virtual Hosting)
 # ==========================================
@@ -142,68 +155,73 @@ methods = GET, POST
 cgi_extension = .py
 ```
 
-Here `main` and `small` share port 8080. The server tells them apart by the `Host` header.
+Here `main` and `api` share port 8080. The server tells them apart by the `Host` header.
 
-### Server options
+### Server Options
 
 | Key | Meaning | Default |
-|---|---|---|
-| `host` | Address to listen on (`127.0.0.1`, `0.0.0.0`, or a name) | - |
-| `ports` | Comma-separated list of ports | - |
+| :--- | :--- | :--- |
+| `host` | Address to listen on (127.0.0.1, 0.0.0.0, or a name) | 127.0.0.1 |
+| `ports` | Comma-separated list of ports | 8080 |
 | `server_names` | Host names this server answers to | none |
-| `is_default` | Used when no name matches the `Host` header | `false` |
-| `client_max_body_size` | Max request body in bytes (→ `413` if exceeded) | `1000000` |
+| `is_default` | Used when no name matches the Host header | `false` |
+| `client_max_body_size` | Max request body in bytes (→ 413 if exceeded) | `1000000` |
 | `error_<code>` | Custom page for a status, e.g. `error_404 = error_pages/404.html` | built-in page |
 
-### Route options
+### Route Options
 
 | Key | Meaning |
-|---|---|
+| :--- | :--- |
 | `root` | Folder the route serves files from |
-| `methods` | Allowed methods (`GET, POST, DELETE`). Others get `405` |
-| `index` | Default file for a directory (falls back to `index.html`) |
-| `autoindex` | `true` shows a directory listing when there is no index file, otherwise `403` |
-| `redirect` | Answers `301` with this `Location` |
-| `upload_dir` | Where `POST` multipart uploads are saved |
+| `methods` | Allowed methods (GET, POST, DELETE). Others get 405 |
+| `index` | Default file for a directory (falls back to index.html) |
+| `autoindex` | `true` shows a directory listing when there is no index file, otherwise 403 |
+| `redirect` | Answers 301 with this Location |
+| `upload_dir` | Where POST multipart uploads are saved |
 | `cgi_extension` | Files with this extension are run as CGI (e.g. `.py`, runs with `/usr/bin/python3`) |
 
-The **longest matching route prefix** wins. `/docs` matches `/docs` and `/docs/a.txt`, but not `/docsx`.
+The longest matching route prefix wins. `/docs` matches `/docs` and `/docs/a.txt`, but not `/docsx`.
 
-### What is validated at startup
+---
+
+## What is Validated at Startup
 
 The server refuses to start (exit code 1, with a clear message) when:
-
 - a port is invalid (`abc`, `0`, `70000`, ...)
-- the same port **and** the same server name appear twice
-- `client_max_body_size` is `0`, invalid, or above 1 GiB
+- the same port and the same server name appear twice
+- `client_max_body_size` is 0, invalid, or above 1 GiB
 - a custom error page file does not exist
-- a route `root` folder does not exist
+- a route root folder does not exist
 - no server is defined
 
 Sharing a port is fine as long as the server names differ (virtual hosts). If one address cannot be bound at runtime (for example the port is taken), it is skipped with a message and the other servers keep running.
 
+---
+
 ## Testing
 
-### Unit tests
-
+### Unit Tests
 ```bash
 cargo test
 ```
-
 They cover:
 
 | Area | Examples |
-|---|---|
-| HTTP parsing | request line, headers, bad requests (400), unsupported methods (405), chunked bodies, size limits (413) |
-| Config validation | duplicate ports, invalid ports and body sizes, missing roots and error pages, virtual hosts |
-| Route matching | longest prefix, trailing slashes, redirects, CGI routes, 301/404/405 results |
-| Responses | status line, `Content-Length`, no body on 204, header-injection protection |
-| Connections | timeout rules (idle, slowloris, stalled write, draining) |
-| CGI | environment, output parsing, timeouts, output limit, script outside root refused |
-| Sessions | unique ids, lookup, expiry |
+| :--- | :--- |
+| **HTTP parsing** | request line, headers, bad requests (400), unsupported methods (405), chunked bodies, size limits (413) |
+| **Config validation** | duplicate ports, invalid ports and body sizes, missing roots and error pages, virtual hosts |
+| **Route matching** | longest prefix, trailing slashes, redirects, CGI routes, 301/404/405 results |
+| **Responses** | status line, Content-Length, no body on 204, header-injection protection |
+| **Connections** | timeout rules (idle, slowloris, stalled write, draining) |
+| **CGI** | environment, output parsing, timeouts, output limit, script outside root refused |
+| **Sessions** | unique ids, lookup, expiry |
 
-### Manual tests with curl
+### Integration & Automation Scripts
+- **CGI Tests:** `bash tests/cgi.sh`
+- **Body Size Limit Tests:** `bash tests/body_limit.sh`
+- **Method & Routing Tests:** `bash tests/methods.sh`
 
+### Manual Tests with curl
 Start the server with the example config, then try:
 
 ```bash
@@ -244,28 +262,30 @@ curl -i http://localhost:8080/
 
 Uploaded files are saved as `<timestamp>_<original name>` so they never overwrite each other.
 
-**Config error check:** copy the example config, make two servers use the same port with the same `server_names`, and start the server. It must stop with a `Configuration Error` message.
+*Config error check:* Copy the example config, make two servers use the same port with the same `server_names`, and start the server. It must stop with a Configuration Error message.
 
-### Stress test
-
+### Stress & Memory Testing
 ```bash
-siege -b http://127.0.0.1:8080/
+python3 tests/stress.py
 ```
+*Target:* Availability of at least 99.5%.
 
-Target: availability of at least 99.5%. While it runs, watch memory with `top` and check for leaked sockets or processes afterwards:
+**Memory leak check with Valgrind:**
+1. `pkill -f localserver`
+2. `valgrind --leak-check=full --show-leak-kinds=all --track-origins=yes ./target/debug/localserver`
+3. Run `python3 tests/stress.py` in another terminal
+4. Stop server with `Ctrl + C` and verify `definitely lost: 0 bytes`
 
-```bash
-ls /proc/$(pgrep localserver)/fd | wc -l
-```
+---
 
-> Only run `siege` against servers you own or have permission to test.
+## Design Notes
 
-## Design notes
+- **One event loop:** A single `mio::Poll` watches listeners, clients and CGI pipes. Every read and write is driven by an event, and each connection is advanced until its socket returns `WouldBlock`.
+- **State machine per client:** `Reading` → `Writing` → (keep-alive) `Reading`, with `WaitingCgi` and `Draining` for CGI and graceful close.
+- **Never blocking on CGI:** Script input and output are non-blocking pipes registered in the same poll. A script running more than 10 seconds gets a 504.
+- **Safe by default:** Paths are checked against `..` and symlinks leaving the root, CGI starts with an empty environment, and header values are stripped of CR/LF.
 
-- **One event loop.** A single `mio::Poll` watches listeners, clients and CGI pipes. Every read and write is driven by an event, and each connection is advanced until its socket returns `WouldBlock`.
-- **State machine per client:** `Reading → Writing → (keep-alive) Reading`, with `WaitingCgi` and `Draining` for CGI and graceful close.
-- **Never blocking on CGI.** Script input and output are non-blocking pipes registered in the same poll. A script running more than 10 seconds gets a `504`.
-- **Safe by default.** Paths are checked against `..` and symlinks leaving the root, CGI starts with an empty environment, and header values are stripped of CR/LF.
+---
 
 ## Limitations
 
