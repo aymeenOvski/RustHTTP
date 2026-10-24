@@ -1,40 +1,50 @@
 #!/usr/bin/env bash
-URL="http://localhost:8080/files"
-LIMIT=1048576 # make sure this matches the limit in the server config
+# Tests the client body size limit (client_max_body_size).
+# Start the server first, then run: bash tests/body_limit.sh
+# The limit of the "main" server is 1048576 bytes (1 MB).
+#
+# curl flags used everywhere below:
+#   -s                 silent: no progress bar
+#   -o /dev/null       throw the response page away
+#   -w "%{http_code}\n"  print only the status code (200, 413...)
+#   -X POST            send a POST request
+#   --data-binary @f   send the content of file f as the request body
 
-# check NAME EXPECTED ACTUAL
-check() {
-  if [ "$3" = "$1" ] || { [ "$1" = "not413" ] && [ "$3" != "413" ]; }; then
-    echo "PASS  $2 (got $3)"
-  else
-    echo "FAIL  $2 (got $3)"
-  fi
-}
+echo "1) small body (10 bytes) -> expect: NOT 413"
+# WHAT: create a 10 byte body.  HOW: head -c 10 reads 10 bytes from /dev/zero (endless zero bytes).
+head -c 10 /dev/zero > /tmp/body.txt
+# WHAT: send it to the server.  HOW: curl POSTs the file; the server must not answer 413.
+curl -s -o /dev/null -w "%{http_code}\n" -X POST --data-binary @/tmp/body.txt http://localhost:8080/files
 
-make_body() { head -c "$1" /dev/zero | tr '\0' 'a' > /tmp/body.txt; }
+echo "2) body exactly 1048576 bytes -> expect: NOT 413"
+# WHAT: create a body exactly at the limit.  HOW: same trick, 1048576 bytes.
+head -c 1048576 /dev/zero > /tmp/body.txt
+# WHAT: the limit itself must be accepted.  HOW: curl sends Content-Length: 1048576, server checks size > limit.
+curl -s -o /dev/null -w "%{http_code}\n" -X POST --data-binary @/tmp/body.txt http://localhost:8080/files
 
-make_body 10
-code=$(curl -s -o /dev/null -w "%{http_code}" -X POST --data-binary @/tmp/body.txt "$URL")
-check not413 "small body (10 bytes)" "$code"
+echo "3) body 1048577 bytes (1 over the limit) -> expect: 413"
+# WHAT: create a body one byte too big.  HOW: 1048576 + 1 bytes.
+head -c 1048577 /dev/zero > /tmp/body.txt
+# WHAT: the server must refuse it.  HOW: it sees Content-Length > limit and answers 413 Payload Too Large.
+curl -s -o /dev/null -w "%{http_code}\n" -X POST --data-binary @/tmp/body.txt http://localhost:8080/files
 
-make_body $LIMIT
-code=$(curl -s -o /dev/null -w "%{http_code}" -X POST --data-binary @/tmp/body.txt "$URL")
-check not413 "body exactly at the limit" "$code"
+echo "4) body 50 MB -> expect: 413 (refused from the header, never fully read)"
+# WHAT: create a huge body.  HOW: 52428800 bytes = 50 MB.
+head -c 52428800 /dev/zero > /tmp/body.txt
+# WHAT: the server must refuse without reading all of it.  HOW: the decision comes from the Content-Length header alone.
+curl -s -o /dev/null -w "%{http_code}\n" -X POST --data-binary @/tmp/body.txt http://localhost:8080/files
 
-make_body $((LIMIT + 1))
-code=$(curl -s -o /dev/null -w "%{http_code}" -X POST --data-binary @/tmp/body.txt "$URL")
-check 413 "body 1 byte over the limit" "$code"
+echo "5) chunked body over the limit -> expect: 413"
+# WHAT: create a body over the limit.  HOW: 1048577 bytes.
+head -c 1048577 /dev/zero > /tmp/body.txt
+# WHAT: send it in chunks, with no Content-Length.  HOW: the header Transfer-Encoding: chunked makes curl
+#       send the body piece by piece, so the server must count the bytes itself while decoding.
+curl -s -o /dev/null -w "%{http_code}\n" -X POST -H "Transfer-Encoding: chunked" --data-binary @/tmp/body.txt http://localhost:8080/files
 
-make_body 52428800
-code=$(curl -s -o /dev/null -w "%{http_code}" -X POST --data-binary @/tmp/body.txt "$URL")
-check 413 "huge body (50 MB)" "$code"
+echo "6) empty body -> expect: NOT 413"
+# WHAT: a POST with no body is valid.  HOW: -d "" sends an empty body (Content-Length: 0).
+curl -s -o /dev/null -w "%{http_code}\n" -X POST -d "" http://localhost:8080/files
 
-make_body $((LIMIT + 1))
-code=$(curl -s -o /dev/null -w "%{http_code}" -X POST -H "Transfer-Encoding: chunked" --data-binary @/tmp/body.txt "$URL")
-check 413 "chunked body over the limit" "$code"
-
-code=$(curl -s -o /dev/null -w "%{http_code}" -X POST -d "" "$URL")
-check not413 "empty body" "$code"
-
-code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/)
-check 200 "server still alive after all that" "$code"
+echo "7) server still alive -> expect: 200"
+# WHAT: prove the server survived all the refused requests.  HOW: a normal GET on the home page.
+curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8080/
