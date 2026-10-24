@@ -170,6 +170,24 @@ pub fn validate(config: &Config) -> Result<(), String> {
     let mut seen = std::collections::HashSet::new();
 
     for server in &config.servers {
+        // On one host:port, at most one server may be the default.
+        let mut defaults: HashMap<(String, u16), usize> = HashMap::new();
+        for server in &config.servers {
+            if !server.is_default {
+                continue;
+            }
+            for port in &server.ports {
+                let count = defaults.entry((server.host.clone(), *port)).or_insert(0);
+                *count += 1;
+                if *count > 1 {
+                    return Err(format!(
+                        "Configuration Error: more than one default server on {}:{}",
+                        server.host, port
+                    ));
+                }
+            }
+        }
+
         // A server without names counts as one unnamed server.
         let names: Vec<String> = if server.server_names.is_empty() {
             vec![String::new()]
@@ -230,6 +248,21 @@ pub fn validate(config: &Config) -> Result<(), String> {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn two_defaults_on_one_port_are_refused() {
+        let text = server("a", "8080", "server_names = a.com\nis_default = true")
+            + &server("b", "8080", "server_names = b.com\nis_default = true");
+        let err = load_text("two_defaults", &text).unwrap_err();
+        assert!(err.contains("default"), "{err}");
+    }
+
+    #[test]
+    fn defaults_on_different_ports_are_fine() {
+        let text = server("a", "8080", "server_names = a.com\nis_default = true")
+            + &server("b", "9090", "server_names = b.com\nis_default = true");
+        assert!(load_text("defaults_ok", &text).is_ok());
+    }
 
     #[test]
     fn test_duplicate_port_validation() {
